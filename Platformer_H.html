@@ -330,12 +330,12 @@
             this.wallStuckFrames = 0;
           }
 
-          const clingingAndNotMovingX = obs.player.wallClingDir !== 0 && this.xStuckFrames > 14;
+          const clingingAndNotMovingX = obs.player.wallClingDir !== 0 && !obs.player.grounded && Math.abs(obs.player.vy) < 120 && this.xStuckFrames > 24;
           if (this.wallStuckFrames > 16 || clingingAndNotMovingX) {
             this.wallStuckFrames = 0;
             this.xStuckFrames = 0;
-            this.unstickFrames = 30;
-            this.escapeFrames = Math.max(this.escapeFrames, 34);
+            this.unstickFrames = 22;
+            this.escapeFrames = Math.max(this.escapeFrames, 32);
             this.preferredDir = obs.player.wallClingDir !== 0 ? -obs.player.wallClingDir : -this.preferredDir;
             this.wallJumpCooldown = 0;
           }
@@ -348,13 +348,14 @@
 
           if (this.unstickFrames > 0) {
             this.unstickFrames--;
-            action.left = obs.player.wallClingDir > 0;
-            action.right = obs.player.wallClingDir < 0;
 
-            const canBurstJump = obs.player.wallClingDir !== 0 || obs.player.grounded;
-            if (canBurstJump && this.wallJumpCooldown <= 0) {
+            const escapeDir = obs.player.wallClingDir !== 0 ? -obs.player.wallClingDir : this.preferredDir;
+            action.left = escapeDir < 0;
+            action.right = escapeDir > 0;
+
+            if (obs.player.wallClingDir !== 0 && this.wallJumpCooldown <= 0) {
               action.jump = true;
-              this.wallJumpCooldown = 8;
+              this.wallJumpCooldown = 7;
             }
 
             this.wallJumpCooldown--;

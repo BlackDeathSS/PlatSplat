@@ -291,6 +291,7 @@
           this.escapeFrames = 0;
           this.wallStuckFrames = 0;
           this.unstickFrames = 0;
+          this.xStuckFrames = 0;
           this.lastPos = null;
           this.preferredDir = 1;
         }
@@ -300,6 +301,7 @@
           this.escapeFrames = 0;
           this.wallStuckFrames = 0;
           this.unstickFrames = 0;
+          this.xStuckFrames = 0;
           this.lastPos = obs ? { x: obs.player.x, y: obs.player.y } : null;
           this.preferredDir = 1;
         }
@@ -309,6 +311,8 @@
           if (this.lastPos) {
             const moved = Math.hypot(obs.player.x - this.lastPos.x, obs.player.y - this.lastPos.y);
             this.stagnationFrames = moved < 1.2 ? this.stagnationFrames + 1 : 0;
+            const movedX = Math.abs(obs.player.x - this.lastPos.x);
+            this.xStuckFrames = movedX < 0.35 ? this.xStuckFrames + 1 : 0;
           }
           this.lastPos = { x: obs.player.x, y: obs.player.y };
 
@@ -326,11 +330,14 @@
             this.wallStuckFrames = 0;
           }
 
-          if (this.wallStuckFrames > 16) {
+          const clingingAndNotMovingX = obs.player.wallClingDir !== 0 && this.xStuckFrames > 14;
+          if (this.wallStuckFrames > 16 || clingingAndNotMovingX) {
             this.wallStuckFrames = 0;
-            this.unstickFrames = 24;
-            this.escapeFrames = Math.max(this.escapeFrames, 28);
-            this.preferredDir = -obs.player.wallClingDir;
+            this.xStuckFrames = 0;
+            this.unstickFrames = 30;
+            this.escapeFrames = Math.max(this.escapeFrames, 34);
+            this.preferredDir = obs.player.wallClingDir !== 0 ? -obs.player.wallClingDir : -this.preferredDir;
+            this.wallJumpCooldown = 0;
           }
 
           let dir = obs.goal.dx < -10 ? -1 : 1;
@@ -343,7 +350,14 @@
             this.unstickFrames--;
             action.left = obs.player.wallClingDir > 0;
             action.right = obs.player.wallClingDir < 0;
-            action.jump = false;
+
+            const canBurstJump = obs.player.wallClingDir !== 0 || obs.player.grounded;
+            if (canBurstJump && this.wallJumpCooldown <= 0) {
+              action.jump = true;
+              this.wallJumpCooldown = 8;
+            }
+
+            this.wallJumpCooldown--;
             return makeAction(action);
           }
 

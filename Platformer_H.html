@@ -106,9 +106,6 @@
           <select id="agentSelect" style="background:#1a1a2b; color:var(--fg); border:1px solid rgba(255,255,255,0.2); border-radius:8px; padding:6px 8px;">
             <option value="human">Human</option>
             <option value="rule">RuleBased</option>
-            <option value="planner">Planner (A*)</option>
-            <option value="ppo">PPO</option>
-            <option value="bcppo">BC+PPO</option>
           </select>
         </label>
         <button id="btnFullscreen">⛶ Fullscreen</button>
@@ -402,489 +399,11 @@
         onEpisodeEnd() {}
       }
 
-      class AStarPlannerAgent {
-        constructor() {
-          this.planTiles = [];
-          this.planCursor = 0;
-          this.lastReplanFrame = -9999;
-          this.stuckFrames = 0;
-          this.lastPos = null;
-          this.frameCount = 0;
-          this.maxJumpHeightTiles = 4;
-          this.maxJumpDistanceTiles = 5;
-          this.maxDropTiles = 5;
-          this.fallbackAgent = new RuleBasedAgent();
-        }
-
-        reset(obs) {
-          this.planTiles = [];
-          this.planCursor = 0;
-          this.lastReplanFrame = -9999;
-          this.stuckFrames = 0;
-          this.lastPos = obs ? { x: obs.player.x, y: obs.player.y } : null;
-          this.frameCount = 0;
-          this.fallbackAgent.reset(obs);
-          this.replan(obs);
-        }
-
-        isSolidGeometry(ch) {
-          return ch === "#" || ch === "@" || ch === "-";
-        }
-
-        isBlockedGeometry(ch) {
-          return ch === "#" || ch === "@";
-        }
-
-        isHazard(ch) {
-          return ch === "!";
-        }
-
-        canOccupyTile(tx, ty) {
-          if (tx < 0 || tx >= cols || ty < 0 || ty >= rows) return false;
-          const feet = tileAt(tx, ty);
-          const head = tileAt(tx, ty - 1);
-          return !this.isBlockedGeometry(feet) && !this.isBlockedGeometry(head) && !this.isHazard(feet) && !this.isHazard(head);
-        }
-
-        hasSupport(tx, ty) {
-          if (ty + 1 >= rows) return false;
-          const below = tileAt(tx, ty + 1);
-          return this.isSolidGeometry(below);
-        }
-
-        nodeKey(tx, ty) {
-          return `${tx},${ty}`;
-        }
-
-        heuristic(ax, ay, bx, by) {
-          return Math.abs(ax - bx) + Math.abs(ay - by) * 1.35;
-        }
-
-        getNeighbors(node) {
-          const neighbors = [];
-
-          for (const dir of [-1, 1]) {
-            const ntx = node.x + dir;
-            const nty = node.y;
-            if (this.canOccupyTile(ntx, nty) && this.hasSupport(ntx, nty)) {
-              neighbors.push({ x: ntx, y: nty, cost: 1.0 });
-            }
-          }
-
-          for (let dx = -this.maxJumpDistanceTiles; dx <= this.maxJumpDistanceTiles; dx++) {
-            if (dx === 0) continue;
-            for (let dy = 1; dy <= this.maxJumpHeightTiles; dy++) {
-              const ntx = node.x + dx;
-              const nty = node.y - dy;
-              if (!this.canOccupyTile(ntx, nty) || !this.hasSupport(ntx, nty)) continue;
-
-              const xStep = dx > 0 ? 1 : -1;
-              let clearArc = true;
-              for (let x = node.x; x !== ntx; x += xStep) {
-                if (!this.canOccupyTile(x, node.y - Math.min(dy, 2))) {
-                  clearArc = false;
-                  break;
-                }
-              }
-              if (clearArc) neighbors.push({ x: ntx, y: nty, cost: 1.7 + Math.abs(dx) * 0.25 + dy * 0.2 });
-            }
-          }
-
-          for (let dir of [-1, 1]) {
-            const ntx = node.x + dir;
-            for (let drop = 1; drop <= this.maxDropTiles; drop++) {
-              const nty = node.y + drop;
-              if (!this.canOccupyTile(ntx, nty)) break;
-              if (this.hasSupport(ntx, nty)) {
-                neighbors.push({ x: ntx, y: nty, cost: 1.2 + drop * 0.3 });
-                break;
-              }
-            }
-          }
-
-          return neighbors;
-        }
-
-        findPath(start, goal) {
-          const open = [{ x: start.x, y: start.y, f: 0 }];
-          const gScore = new Map([[this.nodeKey(start.x, start.y), 0]]);
-          const cameFrom = new Map();
-          const closed = new Set();
-          const budget = 3200;
-          let explored = 0;
-
-          while (open.length > 0 && explored < budget) {
-            explored++;
-            let bestIndex = 0;
-            for (let i = 1; i < open.length; i++) {
-              if (open[i].f < open[bestIndex].f) bestIndex = i;
-            }
-            const current = open.splice(bestIndex, 1)[0];
-            const currentKey = this.nodeKey(current.x, current.y);
-            if (closed.has(currentKey)) continue;
-
-            if (Math.abs(current.x - goal.x) <= 1 && Math.abs(current.y - goal.y) <= 1) {
-              const path = [{ x: current.x, y: current.y }];
-              let k = currentKey;
-              while (cameFrom.has(k)) {
-                const prev = cameFrom.get(k);
-                path.push(prev);
-                k = this.nodeKey(prev.x, prev.y);
-              }
-              path.reverse();
-              return path;
-            }
-
-            closed.add(currentKey);
-            const currentG = gScore.get(currentKey) ?? Infinity;
-
-            for (const next of this.getNeighbors(current)) {
-              const nKey = this.nodeKey(next.x, next.y);
-              if (closed.has(nKey)) continue;
-              const candidate = currentG + next.cost;
-              if (candidate >= (gScore.get(nKey) ?? Infinity)) continue;
-
-              cameFrom.set(nKey, { x: current.x, y: current.y });
-              gScore.set(nKey, candidate);
-              const h = this.heuristic(next.x, next.y, goal.x, goal.y);
-              open.push({ x: next.x, y: next.y, f: candidate + h });
-            }
-          }
-
-          return [];
-        }
-
-        toTilePosition(obs) {
-          const cx = obs.player.x + player.w * 0.5;
-          const cy = obs.player.y + player.h * 0.5;
-          return { x: Math.floor(cx / TILE), y: Math.floor(cy / TILE) };
-        }
-
-        findGoalTile() {
-          if (!goalRect) return null;
-          return {
-            x: Math.floor((goalRect.x + goalRect.w * 0.5) / TILE),
-            y: Math.floor((goalRect.y + goalRect.h * 0.75) / TILE),
-          };
-        }
-
-        replan(obs) {
-          const start = this.toTilePosition(obs);
-          const goal = this.findGoalTile();
-          if (!goal) {
-            this.planTiles = [];
-            this.planCursor = 0;
-            return;
-          }
-          const path = this.findPath(start, goal);
-          this.planTiles = path;
-          this.planCursor = path.length > 1 ? 1 : 0;
-          this.lastReplanFrame = this.frameCount;
-        }
-
-        maybeAdvancePlan(currentTile) {
-          while (this.planCursor < this.planTiles.length) {
-            const target = this.planTiles[this.planCursor];
-            if (Math.abs(target.x - currentTile.x) <= 0 && Math.abs(target.y - currentTile.y) <= 0) {
-              this.planCursor++;
-            } else {
-              break;
-            }
-          }
-        }
-
-        shouldUseFallback(obs) {
-          if (this.planTiles.length === 0 || this.planCursor >= this.planTiles.length) return true;
-          return false;
-        }
-
-        act(obs) {
-          this.frameCount++;
-
-          if (this.lastPos) {
-            const moved = Math.hypot(obs.player.x - this.lastPos.x, obs.player.y - this.lastPos.y);
-            this.stuckFrames = moved < 0.8 ? this.stuckFrames + 1 : 0;
-          }
-          this.lastPos = { x: obs.player.x, y: obs.player.y };
-
-          const currentTile = this.toTilePosition(obs);
-          this.maybeAdvancePlan(currentTile);
-
-          const needsReplan = this.planTiles.length === 0
-            || this.planCursor >= this.planTiles.length
-            || this.stuckFrames > 40
-            || this.frameCount - this.lastReplanFrame > 150;
-
-          if (needsReplan) {
-            this.stuckFrames = 0;
-            this.replan(obs);
-          }
-
-          if (this.shouldUseFallback(obs)) {
-            return this.fallbackAgent.act(obs);
-          }
-
-          const target = this.planTiles[this.planCursor];
-          const targetX = target.x * TILE + TILE * 0.5;
-          const targetY = target.y * TILE + TILE * 0.5;
-          const dx = targetX - (obs.player.x + player.w * 0.5);
-          const dy = targetY - (obs.player.y + player.h * 0.5);
-          const action = { left: false, right: false, jump: false, down: false };
-
-          if (Math.abs(dx) > 4) {
-            action.left = dx < 0;
-            action.right = dx > 0;
-          }
-
-          if (obs.player.grounded) {
-            if (dy < -TILE * 0.35) action.jump = true;
-            if (isGapAhead(obs, action.right ? 1 : -1) && Math.abs(dx) > TILE * 0.6) action.jump = true;
-            if (isWallAhead(obs, action.right ? 1 : -1)) action.jump = true;
-          }
-
-          if (!obs.player.grounded && obs.player.wallClingDir !== 0 && dy < -8) {
-            action.jump = true;
-            action.left = obs.player.wallClingDir > 0;
-            action.right = obs.player.wallClingDir < 0;
-          }
-
-          return makeAction(action);
-        }
-
-        onStep() {}
-        onEpisodeEnd() {}
-      }
-
-
-      const DISCRETE_ACTIONS = [
-        makeAction({}),
-        makeAction({ right: true }),
-        makeAction({ left: true }),
-        makeAction({ jump: true }),
-        makeAction({ right: true, jump: true }),
-        makeAction({ left: true, jump: true }),
-        makeAction({ down: true }),
-      ];
-
-      function actionToIndex(action) {
-        const normalized = makeAction(action);
-        for (let i = 0; i < DISCRETE_ACTIONS.length; i++) {
-          const candidate = DISCRETE_ACTIONS[i];
-          if (candidate.left === normalized.left && candidate.right === normalized.right && candidate.jump === normalized.jump && candidate.down === normalized.down) {
-            return i;
-          }
-        }
-        return 0;
-      }
-
-      function indexToAction(index) {
-        return DISCRETE_ACTIONS[Math.max(0, Math.min(DISCRETE_ACTIONS.length - 1, index))];
-      }
-
-      function softmax(logits) {
-        const maxLogit = Math.max(...logits);
-        const exps = logits.map((v) => Math.exp(v - maxLogit));
-        const sum = exps.reduce((a, b) => a + b, 0) || 1;
-        return exps.map((v) => v / sum);
-      }
-
-      function sampleFromProbs(probs) {
-        const r = Math.random();
-        let cum = 0;
-        for (let i = 0; i < probs.length; i++) {
-          cum += probs[i];
-          if (r <= cum) return i;
-        }
-        return probs.length - 1;
-      }
-
-      function dot(a, b) {
-        let v = 0;
-        for (let i = 0; i < a.length; i++) v += a[i] * b[i];
-        return v;
-      }
-
-      function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
-
-      function extractPolicyFeatures(obs) {
-        const dirToGoal = clamp(obs.goal.dx / (TILE * 20), -1, 1);
-        const goalY = clamp(obs.goal.dy / (TILE * 10), -1, 1);
-        const speedX = clamp(obs.player.vx / MAX_VX, -1, 1);
-        const speedY = clamp(obs.player.vy / 700, -1, 1);
-        const grounded = obs.player.grounded ? 1 : 0;
-        const wall = obs.player.wallClingDir;
-        const gapRight = isGapAhead(obs, 1) ? 1 : 0;
-        const gapLeft = isGapAhead(obs, -1) ? 1 : 0;
-        const wallRight = isWallAhead(obs, 1) ? 1 : 0;
-        const wallLeft = isWallAhead(obs, -1) ? 1 : 0;
-        const deathRight = isDeathAhead(obs, 1) ? 1 : 0;
-        const deathLeft = isDeathAhead(obs, -1) ? 1 : 0;
-        const bulletAlert = isIncomingBullet(obs, 25) ? 1 : 0;
-        const enemyAlert = isEnemyThreat(obs, TILE * 2.5) ? 1 : 0;
-        const nearestEnemyDx = obs.enemies[0] ? clamp(obs.enemies[0].dx / (TILE * 10), -1, 1) : 0;
-        const nearestEnemyDy = obs.enemies[0] ? clamp(obs.enemies[0].dy / (TILE * 8), -1, 1) : 0;
-        const nearestBulletDx = obs.bullets[0] ? clamp(obs.bullets[0].dx / (TILE * 12), -1, 1) : 0;
-
-        return [1, dirToGoal, goalY, speedX, speedY, grounded, wall, gapRight, gapLeft, wallRight, wallLeft, deathRight, deathLeft, bulletAlert, enemyAlert, nearestEnemyDx, nearestEnemyDy, nearestBulletDx];
-      }
-
-      class PPOAgent {
-        constructor(config = {}) {
-          this.actionCount = DISCRETE_ACTIONS.length;
-          this.featureCount = null;
-          this.rolloutSize = config.rolloutSize || 256;
-          this.gamma = config.gamma || 0.992;
-          this.gaeLambda = config.gaeLambda || 0.95;
-          this.clipEpsilon = config.clipEpsilon || 0.2;
-          this.learningRate = config.learningRate || 0.012;
-          this.valueCoef = config.valueCoef || 0.5;
-          this.entropyCoef = config.entropyCoef || 0.01;
-          this.epochs = config.epochs || 3;
-          this.explore = config.explore ?? true;
-          this.rollout = [];
-          this.lastTransition = null;
-          this.policy = null;
-          this.valueWeights = null;
-        }
-
-        initializeModel(obs) {
-          if (this.policy && this.valueWeights) return;
-          this.featureCount = extractPolicyFeatures(obs).length;
-          this.policy = Array.from({ length: this.actionCount }, () => Array.from({ length: this.featureCount }, () => (Math.random() - 0.5) * 0.02));
-          this.valueWeights = Array.from({ length: this.featureCount }, () => (Math.random() - 0.5) * 0.02);
-        }
-
-        reset(obs) {
-          if (obs) this.initializeModel(obs);
-          this.lastTransition = null;
-        }
-
-        computeLogits(features) { return this.policy.map((weights) => dot(weights, features)); }
-        value(features) { return dot(this.valueWeights, features); }
-
-        act(obs) {
-          this.initializeModel(obs);
-          const features = extractPolicyFeatures(obs);
-          const logits = this.computeLogits(features);
-          const probs = softmax(logits);
-          const actionIndex = this.explore ? sampleFromProbs(probs) : probs.indexOf(Math.max(...probs));
-          this.lastTransition = {
-            features,
-            actionIndex,
-            logProb: Math.log(Math.max(probs[actionIndex], 1e-8)),
-            value: this.value(features),
-          };
-          return indexToAction(actionIndex);
-        }
-
-        onStep(transition) {
-          if (!this.lastTransition) return;
-          this.rollout.push({ ...this.lastTransition, reward: transition.reward, done: transition.done });
-          if (this.rollout.length >= this.rolloutSize) this.trainOnRollout();
-        }
-
-        discountedAdvantages(steps) {
-          const adv = new Array(steps.length).fill(0);
-          const returns = new Array(steps.length).fill(0);
-          let gae = 0;
-          let nextValue = 0;
-          for (let t = steps.length - 1; t >= 0; t--) {
-            const delta = steps[t].reward + this.gamma * nextValue * (steps[t].done ? 0 : 1) - steps[t].value;
-            gae = delta + this.gamma * this.gaeLambda * (steps[t].done ? 0 : 1) * gae;
-            adv[t] = gae;
-            returns[t] = adv[t] + steps[t].value;
-            nextValue = steps[t].value;
-          }
-          const mean = adv.reduce((a, b) => a + b, 0) / Math.max(1, adv.length);
-          const variance = adv.reduce((a, b) => a + (b - mean) * (b - mean), 0) / Math.max(1, adv.length);
-          const std = Math.sqrt(variance) || 1;
-          for (let i = 0; i < adv.length; i++) adv[i] = (adv[i] - mean) / std;
-          return { adv, returns };
-        }
-
-        trainOnRollout() {
-          if (!this.policy || !this.valueWeights) return;
-          if (this.rollout.length < 32) return;
-          const batch = this.rollout.splice(0, this.rollout.length);
-          const { adv, returns } = this.discountedAdvantages(batch);
-          for (let epoch = 0; epoch < this.epochs; epoch++) {
-            for (let i = 0; i < batch.length; i++) {
-              const sample = batch[i];
-              const logits = this.computeLogits(sample.features);
-              const probs = softmax(logits);
-              const ratio = Math.exp(Math.log(Math.max(probs[sample.actionIndex], 1e-8)) - sample.logProb);
-              const clippedRatio = clamp(ratio, 1 - this.clipEpsilon, 1 + this.clipEpsilon);
-              const policyScale = ((ratio > 1 && adv[i] > 0) || (ratio < 1 && adv[i] < 0) ? clippedRatio : ratio) * adv[i];
-
-              for (let a = 0; a < this.actionCount; a++) {
-                const gradLogPi = (a === sample.actionIndex ? 1 : 0) - probs[a];
-                for (let f = 0; f < this.featureCount; f++) {
-                  this.policy[a][f] += this.learningRate * policyScale * gradLogPi * sample.features[f];
-                }
-              }
-
-              const valueError = returns[i] - this.value(sample.features);
-              for (let f = 0; f < this.featureCount; f++) {
-                this.valueWeights[f] += this.learningRate * this.valueCoef * valueError * sample.features[f];
-              }
-            }
-          }
-        }
-
-        onEpisodeEnd() {
-          if (this.rollout.length >= 64) this.trainOnRollout();
-          this.lastTransition = null;
-        }
-      }
-
-      class BCPPOAgent extends PPOAgent {
-        constructor() {
-          super({ learningRate: 0.008, rolloutSize: 192, epochs: 2 });
-          this.bcWarmStarted = false;
-          this.teacherRule = new RuleBasedAgent();
-          this.teacherPlanner = new AStarPlannerAgent();
-        }
-
-        reset(obs) {
-          if (!this.bcWarmStarted) {
-            this.runBehaviorCloningWarmstart(obs);
-            this.bcWarmStarted = true;
-          }
-          super.reset(obs);
-        }
-
-        runBehaviorCloningWarmstart(obs) {
-          const dataset = [];
-          this.teacherRule.reset(obs);
-          this.teacherPlanner.reset(obs);
-          for (let i = 0; i < 800; i++) {
-            const sampleObs = buildObservation();
-            const teacher = (sampleObs.enemies.length > 0 || sampleObs.bullets.length > 0) ? this.teacherRule : this.teacherPlanner;
-            dataset.push({ features: extractPolicyFeatures(sampleObs), actionIndex: actionToIndex(teacher.act(sampleObs)) });
-          }
-
-          for (let epoch = 0; epoch < 8; epoch++) {
-            for (const sample of dataset) {
-              const probs = softmax(this.computeLogits(sample.features));
-              for (let a = 0; a < this.actionCount; a++) {
-                const grad = (a === sample.actionIndex ? 1 : 0) - probs[a];
-                for (let f = 0; f < this.featureCount; f++) {
-                  this.policy[a][f] += 0.02 * grad * sample.features[f];
-                }
-              }
-            }
-          }
-        }
-      }
-
       class AgentManager {
         constructor() {
           this.agents = {
             human: new HumanAgent(),
             rule: new RuleBasedAgent(),
-            planner: new AStarPlannerAgent(),
-            ppo: new PPOAgent(),
-            bcppo: new BCPPOAgent(),
           };
           this.activeKey = "human";
         }
@@ -892,17 +411,8 @@
           this.activeKey = this.agents[key] ? key : "human";
           this.agents[this.activeKey].reset(buildObservation());
         }
-        isActive(key) {
-          return this.activeKey === key;
-        }
         getAction(obs = buildObservation()) {
           return this.agents[this.activeKey].act(obs);
-        }
-        onStep(transition) {
-          this.agents[this.activeKey].onStep?.(transition);
-        }
-        onEpisodeEnd(summary) {
-          this.agents[this.activeKey].onEpisodeEnd?.(summary);
         }
       }
 
@@ -1203,7 +713,6 @@
       function resetGame() {
           if (!isReplaying && currentRun.length > 0) {
               lastRun = [...currentRun];
-              agentManager.onEpisodeEnd({ won: player.won, dead: player.dead, timeElapsed, frames: currentRun.length });
               if (player.won && timeElapsed < bestTime) {
                   bestTime = timeElapsed;
                   bestRun = [...currentRun];
@@ -1239,58 +748,38 @@
                 timerEl.textContent = timeElapsed.toFixed(2) + "s";
             } else { winMsgEl.style.display = 'block'; }
 
-            const obsBefore = buildObservation();
-            const prevAlive = !player.dead;
-            applyControlAction(agentManager.getAction(obsBefore));
+            applyControlAction(agentManager.getAction());
 
             player.update();
             currentRun.push({ x: player.x, y: player.y, dead: player.dead, won: player.won });
             
-            const plannerStaticMode = agentManager.isActive("planner");
-            if (!plannerStaticMode) {
-              for (let i = bullets.length - 1; i >= 0; i--) {
-                  bullets[i].update();
-                  if (bullets[i].dead) bullets.splice(i, 1);
-                  else if (overlaps(bullets[i], player)) player.dead = true;
-              }
-
-              for (let i = enemies.length - 1; i >= 0; i--) {
-                  let e = enemies[i];
-                  if (e.dead) continue;
-                  e.update();
-                  
-                  if (overlaps(player, e)) {
-                      const prevBottom = player.prevY + player.h;
-                      const enemyTop = e.y;
-                      const fromAboveLastFrame = prevBottom <= enemyTop + 6;
-                      const fromAboveNow = player.y + player.h <= e.y + e.h * 0.65;
-                      const isDescending = player.vy > 20;
-
-                      if (isDescending && (fromAboveLastFrame || fromAboveNow)) {
-                          e.dead = true;
-                          player.vy = JUMP_VY * 0.8;
-                          player.y = Math.min(player.y, e.y - player.h);
-                      } else {
-                          player.dead = true;
-                      }
-                  }
-              }
+            for (let i = bullets.length - 1; i >= 0; i--) {
+                bullets[i].update();
+                if (bullets[i].dead) bullets.splice(i, 1);
+                else if (overlaps(bullets[i], player)) player.dead = true;
             }
 
-            const nextObs = buildObservation();
-            const prevGoalDist = goalDistanceScore(obsBefore);
-            const nextGoalDist = goalDistanceScore(nextObs);
-            const progressReward = clamp((prevGoalDist - nextGoalDist) / TILE, -0.18, 0.5);
-            const timePenalty = -0.002;
-            const deathPenalty = (prevAlive && player.dead) ? -1.0 : 0;
-            const winBonus = player.won ? 2.5 : 0;
-            const hazardPenalty = (isIncomingBullet(obsBefore, 20) || isEnemyThreat(obsBefore, TILE * 2.2)) ? -0.003 : 0;
-            agentManager.onStep({
-              reward: progressReward + timePenalty + deathPenalty + winBonus + hazardPenalty,
-              done: player.dead || player.won,
-              observation: obsBefore,
-              nextObservation: nextObs,
-            });
+            for (let i = enemies.length - 1; i >= 0; i--) {
+                let e = enemies[i];
+                if (e.dead) continue;
+                e.update();
+                
+                if (overlaps(player, e)) {
+                    const prevBottom = player.prevY + player.h;
+                    const enemyTop = e.y;
+                    const fromAboveLastFrame = prevBottom <= enemyTop + 6;
+                    const fromAboveNow = player.y + player.h <= e.y + e.h * 0.65;
+                    const isDescending = player.vy > 20;
+
+                    if (isDescending && (fromAboveLastFrame || fromAboveNow)) {
+                        e.dead = true;
+                        player.vy = JUMP_VY * 0.8;
+                        player.y = Math.min(player.y, e.y - player.h);
+                    } else {
+                        player.dead = true;
+                    }
+                }
+            }
         }
 
         const targetCam = player.x - cv.width * 0.35;

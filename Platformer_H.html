@@ -221,28 +221,33 @@
       }
 
       function isSolidCode(code) { return code === 1 || code === 2 || code === 3; }
-      function isGapAhead(obs) {
+      function getObsTile(obs, dx, dy) {
         const centerY = Math.floor(obs.localTiles.length / 2);
         const centerX = Math.floor(obs.localTiles[0].length / 2);
-        const ahead = centerX + 2;
-        const belowAhead = centerY + 2;
-        if (!obs.player.grounded) return false;
-        return ahead < obs.localTiles[0].length && belowAhead < obs.localTiles.length && !isSolidCode(obs.localTiles[belowAhead][ahead]);
+        const y = centerY + dy;
+        const x = centerX + dx;
+        if (y < 0 || y >= obs.localTiles.length || x < 0 || x >= obs.localTiles[0].length) return 1;
+        return obs.localTiles[y][x];
       }
-      function isWallAhead(obs) {
-        const centerY = Math.floor(obs.localTiles.length / 2);
-        const centerX = Math.floor(obs.localTiles[0].length / 2);
-        const ahead = centerX + 1;
-        return isSolidCode(obs.localTiles[centerY][ahead]) || isSolidCode(obs.localTiles[Math.max(0, centerY - 1)][ahead]);
+      function isGapAhead(obs, dir = 1) {
+        if (!obs.player.grounded) return false;
+        return !isSolidCode(getObsTile(obs, dir * 2, 2));
+      }
+      function isWallAhead(obs, dir = 1) {
+        return isSolidCode(getObsTile(obs, dir, 0)) || isSolidCode(getObsTile(obs, dir, -1));
+      }
+      function isDeathAhead(obs, dir = 1) {
+        return getObsTile(obs, dir, 1) === 4 || getObsTile(obs, dir * 2, 1) === 4 || getObsTile(obs, dir, 0) === 4;
       }
       function isIncomingBullet(obs, horizonFrames = 25) {
-        return obs.bullets.some((b) => b.dx > -18 && b.dx < 180 && Math.abs(b.dy) < 22 && b.vx < 0 && Math.abs(b.dx / b.vx) < horizonFrames * FIXED_DT);
+        return obs.bullets.some((b) => b.dx > -24 && b.dx < 190 && Math.abs(b.dy) < 26 && b.vx < 0 && Math.abs(b.dx / b.vx) < horizonFrames * FIXED_DT);
       }
       function isEnemyThreat(obs, radius = TILE * 2.5) {
         return obs.enemies.some((e) => Math.abs(e.dx) < radius && Math.abs(e.dy) < TILE * 1.5);
       }
-      function shouldWallJump(obs) {
-        return obs.player.wallClingDir !== 0 && obs.goal.dy < -10;
+      function shouldWallJump(obs, dir = 1) {
+        if (obs.player.wallClingDir === 0) return false;
+        return obs.goal.dy < 20 || isWallAhead(obs, dir) || isDeathAhead(obs, dir);
       }
 
       class HumanAgent {
@@ -253,28 +258,64 @@
       }
 
       class RuleBasedAgent {
-        constructor() { this.wallJumpCooldown = 0; }
-        reset() { this.wallJumpCooldown = 0; }
+        constructor() {
+          this.wallJumpCooldown = 0;
+          this.stagnationFrames = 0;
+          this.escapeFrames = 0;
+          this.lastPos = null;
+          this.preferredDir = 1;
+        }
+        reset(obs) {
+          this.wallJumpCooldown = 0;
+          this.stagnationFrames = 0;
+          this.escapeFrames = 0;
+          this.lastPos = obs ? { x: obs.player.x, y: obs.player.y } : null;
+          this.preferredDir = 1;
+        }
         act(obs) {
-          const action = { left: false, right: true, jump: false, down: false };
-          if (obs.goal.dx < -10) {
-            action.left = true; action.right = false;
+          const action = { left: false, right: false, jump: false, down: false };
+
+          if (this.lastPos) {
+            const moved = Math.hypot(obs.player.x - this.lastPos.x, obs.player.y - this.lastPos.y);
+            this.stagnationFrames = moved < 1.2 ? this.stagnationFrames + 1 : 0;
           }
+          this.lastPos = { x: obs.player.x, y: obs.player.y };
+
+          if (this.stagnationFrames > 40) {
+            this.stagnationFrames = 0;
+            this.escapeFrames = 55;
+            this.preferredDir *= -1;
+          }
+
+          if (this.escapeFrames > 0) this.escapeFrames--;
+
+          let dir = obs.goal.dx < -10 ? -1 : 1;
+          if (this.escapeFrames > 0) dir = this.preferredDir;
+
+          action.left = dir < 0;
+          action.right = dir > 0;
 
           if (isIncomingBullet(obs, 30)) {
             if (obs.player.grounded) action.jump = true;
-            else { action.left = true; action.right = false; }
+            else {
+              action.left = true;
+              action.right = false;
+            }
           }
 
           if (isEnemyThreat(obs, TILE * 2.2) && obs.player.grounded) action.jump = true;
-          if ((isGapAhead(obs) || isWallAhead(obs)) && obs.player.grounded) action.jump = true;
+          if (isDeathAhead(obs, dir) && obs.player.grounded) action.jump = true;
+          if ((isGapAhead(obs, dir) || isWallAhead(obs, dir)) && obs.player.grounded) action.jump = true;
 
-          if (shouldWallJump(obs) && this.wallJumpCooldown <= 0) {
-            action.jump = true;
-            action.left = obs.player.wallClingDir > 0;
-            action.right = obs.player.wallClingDir < 0;
-            this.wallJumpCooldown = 10;
+          if (shouldWallJump(obs, dir)) {
+            action.left = obs.player.wallClingDir < 0;
+            action.right = obs.player.wallClingDir > 0;
+            if (this.wallJumpCooldown <= 0) {
+              action.jump = true;
+              this.wallJumpCooldown = 6;
+            }
           }
+
           this.wallJumpCooldown--;
           return makeAction(action);
         }

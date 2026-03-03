@@ -1,0 +1,558 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Speedrun Platformer - Action Update</title>
+  <style>
+    :root {
+      --bg: #0b0b10;
+      --panel: #121220;
+      --fg: #e9e9f2;
+      --muted: #9aa0aa;
+      --accent: #7cffd7;
+      --danger: #ff4d6d;
+      --goal: #45ff7a;
+      --replay: #64c8ff;
+      --ghost: #ffc832;
+    }
+
+    html, body {
+      height: 100%; margin: 0; background: var(--bg); color: var(--fg); font-family: system-ui, sans-serif;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+    }
+
+    .wrap { max-width: 950px; width: 100%; padding: 16px; box-sizing: border-box; }
+
+    .card {
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.01));
+      border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 16px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35); overflow: hidden; margin-bottom: 16px;
+      display: flex; flex-direction: column;
+    }
+
+    .card h2 { 
+        margin: 0; padding: 14px 20px; font-size: 18px; color: var(--fg); font-weight: 600; 
+        display: flex; justify-content: space-between; align-items: center;
+        background: rgba(0,0,0,0.2); border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+    
+    .timer-display { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 20px; color: var(--accent); }
+
+    .pad { padding: 16px; position: relative; }
+    canvas { display: block; width: 100%; height: auto; background: rgba(255, 255, 255, 0.02); border-radius: 12px; }
+
+    .tips { color: var(--muted); font-size: 14px; line-height: 1.4; margin-top: 14px; text-align: center; }
+    
+    .status-overlay {
+        position: absolute;
+        top: 50%; left: 50%;
+        transform: translate(-50%, -50%);
+        font-size: 48px; font-weight: bold;
+        text-shadow: 0 4px 15px rgba(0,0,0,0.9);
+        pointer-events: none;
+        display: none;
+        text-align: center;
+    }
+
+    .controls-row {
+        display: flex; gap: 12px; justify-content: center; margin-top: 5px;
+    }
+
+    button {
+      appearance: none; border: none; border-radius: 12px; padding: 12px 18px; font-weight: 800;
+      background: rgba(124, 255, 215, 0.12); color: var(--accent); border: 1px solid rgba(124, 255, 215, 0.30); 
+      cursor: pointer; font-size: 14px; font-family: inherit; transition: all 0.2s ease;
+    }
+    button:hover { filter: brightness(1.2); background: rgba(124, 255, 215, 0.2); transform: translateY(-2px); }
+    button:active { transform: translateY(0); }
+
+    #gameContainer:fullscreen {
+        background: var(--bg); display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 0;
+    }
+    #gameContainer:fullscreen .card {
+        width: 100vw; height: 100vh; border: none; border-radius: 0; margin: 0;
+    }
+    #gameContainer:fullscreen .pad {
+        flex: 1; display: flex; flex-direction: column; justify-content: center; padding: 20px;
+    }
+    #gameContainer:fullscreen canvas {
+        flex: 1; object-fit: contain; max-height: calc(100vh - 120px); width: 100%;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="wrap" id="gameContainer">
+    <div class="card">
+      <h2>
+          <span>Speedrun Platformer</span>
+          <span class="timer-display" id="timer">0.00s</span>
+      </h2>
+      <div class="pad">
+        <canvas id="cv" width="900" height="520"></canvas>
+        <div id="winMsg" class="status-overlay" style="color: var(--goal);">LEVEL CLEARED!<br><span style="font-size:20px; color:#fff">Press 'R' to Restart</span></div>
+        <div id="replayMsg" class="status-overlay" style="color: var(--replay); font-size:32px;">REPLAY MODE</div>
+        <div class="tips" id="tipText">
+          Controls: <b>W A S D</b> or <b>Arrows</b> | <b>S</b>: Drop ledges | <b>Hold toward @ walls</b> to cling/walljump | <b>!</b> are death blocks<br>
+        </div>
+      </div>
+    </div>
+
+    <div class="controls-row">
+        <button id="btnFullscreen">⛶ Fullscreen</button>
+        <button id="btnReplayLast" style="color:var(--muted); border-color:var(--muted); background:rgba(255,255,255,0.05);">▶ Replay Last Run</button>
+        <button id="btnReplayBest" style="color:var(--ghost); border-color:rgba(255,200,50,0.4); background:rgba(255,200,50,0.1);">★ Replay Best Win</button>
+    </div>
+  </div>
+
+  <script>
+    (() => {
+      const cv = document.getElementById("cv"); 
+      const ctx = cv.getContext("2d");
+      const timerEl = document.getElementById("timer");
+      const winMsgEl = document.getElementById("winMsg");
+      const replayMsgEl = document.getElementById("replayMsg");
+
+      // @ = Cling Wall, S = Shooter Enemy, R = Runner Enemy, G = Goal, ! = Death Block     
+      const LEVEL = [
+        "########################################!!####!!#########!!########",
+        "#!......................###.....#.........R..........##...........#",
+        "#!............@..###.....#......@--@#####--#####@#................#",
+        "#!..........@....#..!...........@................@!...............#",
+        "#!........@......#......@.......@#---###---####@.@...#@..!-#.....R#",
+        "#!..#-----#......#......@.........R..............@.......@....#####",
+        "#!..#.....#.............@.......#######.......@###--#####.........#",
+        "#!..#-----#...@@@@......@.....................@!..........#..#....#",
+        "#!..#.....#.......S.....@..S............!@R...@!.!.@.....!#..#....#",
+        "#!..#-----#.....@###@...#######################!...@.......##.!..!#",
+        "#.......................!...!...!..!!..........R...@.R........!..!#",
+        "###############################################################G###",
+      ];
+      
+      const rows = LEVEL.length, cols = LEVEL[0].length, TILE = 24, WORLD_W = cols * TILE, WORLD_H = rows * TILE;
+      const GRAV = 1800, MOVE_ACCEL = 5200, MAX_VX = 260, JUMP_VY = -520, FRICTION = 10, FIXED_DT = 1 / 60;
+
+      const spawn = { x: 2 * TILE, y: 8 * TILE };
+      let goalRect = null;
+      let cameraX = 0;
+      let timeElapsed = 0;
+      
+      let currentRun = [];
+      let lastRun = [];
+      let bestRun = [];
+      let bestTime = Infinity;
+      let isReplaying = false;
+      let replayFrames = [];
+      let replayIndex = 0;
+
+      const keys = { left: false, right: false, jump: false, down: false, jumpPressed: false };
+
+      window.addEventListener('keydown', (e) => {
+          if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
+          if (e.key === 'a' || e.key === 'ArrowLeft') keys.left = true;
+          if (e.key === 'd' || e.key === 'ArrowRight') keys.right = true;
+          if (e.key === 'w' || e.key === 'ArrowUp' || e.code === 'Space') {
+              if (!keys.jump) keys.jumpPressed = true;
+              keys.jump = true;
+          }
+          if (e.key === 's' || e.key === 'ArrowDown') keys.down = true;
+          if (e.key === 'r' || e.key === 'R') resetGame();
+      }, { passive: false });
+
+      window.addEventListener('keyup', (e) => {
+          if (e.key === 'a' || e.key === 'ArrowLeft') keys.left = false;
+          if (e.key === 'd' || e.key === 'ArrowRight') keys.right = false;
+          if (e.key === 'w' || e.key === 'ArrowUp' || e.code === 'Space') keys.jump = false;
+          if (e.key === 's' || e.key === 'ArrowDown') keys.down = false;
+      });
+
+      document.getElementById("btnFullscreen").addEventListener("click", () => {
+          const elem = document.getElementById("gameContainer");
+          if (!document.fullscreenElement) elem.requestFullscreen().catch(err => console.error(err));
+          else document.exitFullscreen();
+      });
+
+      function startReplay(runType) {
+          if (runType === 'last' && lastRun.length > 0) replayFrames = lastRun;
+          else if (runType === 'best' && bestRun.length > 0) replayFrames = bestRun;
+          else { alert(runType === 'best' ? "You haven't won a game yet to save a best run!" : "No recent run found!"); return; }
+          
+          isReplaying = true; replayIndex = 0; winMsgEl.style.display = 'none';
+          replayMsgEl.style.display = 'block'; setTimeout(() => replayMsgEl.style.display = 'none', 1500);
+      }
+
+      document.getElementById("btnReplayLast").addEventListener("click", () => startReplay('last'));
+      document.getElementById("btnReplayBest").addEventListener("click", () => startReplay('best'));
+
+      function tileAt(tx, ty) { return (tx < 0 || ty < 0 || tx >= cols || ty >= rows) ? "#" : LEVEL[ty][tx]; }
+      function isSolid(ch) { return ch === "#" || ch === "-" || ch === "@"; }
+      function overlaps(a, b) { return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y; }
+
+      let enemies = [];
+      let bullets = [];
+
+      class Bullet {
+          constructor(x, y, dir) {
+              this.x = x; this.y = y; this.w = 6; this.h = 6;
+              this.vx = dir * 300; this.dead = false;
+          }
+          update() {
+              this.x += this.vx * FIXED_DT;
+              const tx = Math.floor(this.x / TILE), ty = Math.floor(this.y / TILE);
+              if (isSolid(tileAt(tx, ty))) this.dead = true;
+          }
+      }
+
+      class Enemy {
+          constructor(x, y, type) {
+              this.x = x; this.y = y; this.w = 18; this.h = 22;
+              this.type = type; // 'S' or 'R'
+              this.vx = -60; this.vy = 0; this.dead = false;
+              this.facingLeft = true; this.lastShot = 0;
+          }
+
+          hasLineOfSight(px, py) {
+              if (Math.abs(this.y - py) > TILE * 1.5) return false;
+              if (Math.abs(this.x - px) > TILE * 12) return false;
+              
+              let startTx = Math.floor(Math.min(this.x, px) / TILE);
+              let endTx = Math.floor(Math.max(this.x, px) / TILE);
+              let ty = Math.floor((this.y + this.h / 2) / TILE);
+              
+              for (let tx = startTx; tx <= endTx; tx++) {
+                  if (isSolid(tileAt(tx, ty)) && tileAt(tx, ty) !== "-") return false;
+              }
+              return true; 
+          }
+
+          update() {
+              this.vy += GRAV * FIXED_DT;
+              let canSeePlayer = !player.dead && this.hasLineOfSight(player.x, player.y);
+
+              if (this.type === 'S') {
+                  if (canSeePlayer) {
+                      this.vx = 0; 
+                      this.facingLeft = player.x < this.x;
+                      if (timeElapsed - this.lastShot > 1.5) {
+                          this.lastShot = timeElapsed;
+                          let bX = this.facingLeft ? this.x - 6 : this.x + this.w;
+                          bullets.push(new Bullet(bX, this.y + 10, this.facingLeft ? -1 : 1));
+                      }
+                  } else {
+                      this.vx = this.facingLeft ? -40 : 40;
+                  }
+              } else if (this.type === 'R') {
+                  if (canSeePlayer) {
+                      let dir = player.x < this.x ? -1 : 1;
+                      this.vx = dir * 180;
+                      this.facingLeft = dir < 0;
+                  } else {
+                      this.vx = this.facingLeft ? -60 : 60;
+                  }
+              }
+
+              // Apply X Physics & Collision
+              this.x += this.vx * FIXED_DT;
+              let hitWallX = false;
+              
+              // Determine current grid bounds for X check
+              let left = Math.floor(this.x / TILE), right = Math.floor((this.x + this.w) / TILE);
+              let top = Math.floor(this.y / TILE), bottom = Math.floor((this.y + this.h - 1) / TILE);
+
+              for (let ty = top; ty <= bottom; ty++) {
+                  for (let tx = left; tx <= right; tx++) {
+                      let tile = tileAt(tx, ty);
+                      if (isSolid(tile) && tile !== "-") {
+                          hitWallX = true;
+                          if (this.vx > 0) this.x = tx * TILE - this.w;
+                          else if (this.vx < 0) this.x = tx * TILE + TILE;
+                          this.vx = 0;
+                      } else if (tile === "!") {
+                          // Prevent enemies from casually walking into death blocks
+                          hitWallX = true;
+                          if (this.vx > 0) this.x = tx * TILE - this.w;
+                          else if (this.vx < 0) this.x = tx * TILE + TILE;
+                          this.vx = 0;
+                      }
+                  }
+              }
+
+              if (hitWallX && !canSeePlayer) this.facingLeft = !this.facingLeft;
+
+              // Apply Y Physics & Recalculate Collision bounds!
+              this.y += this.vy * FIXED_DT;
+              
+              left = Math.floor(this.x / TILE); right = Math.floor((this.x + this.w) / TILE);
+              top = Math.floor(this.y / TILE); bottom = Math.floor((this.y + this.h) / TILE);
+
+              for (let ty = top; ty <= bottom; ty++) {
+                  for (let tx = left; tx <= right; tx++) {
+                      if (isSolid(tileAt(tx, ty))) {
+                          const tr = { x: tx * TILE, y: ty * TILE, w: TILE, h: TILE };
+                          if (overlaps(this, tr)) {
+                              if (this.vy > 0) { this.y = tr.y - this.h; this.vy = 0; }
+                          }
+                      }
+                  }
+              }
+          }
+      }
+
+      class Player {
+        constructor() {
+          this.x = spawn.x; this.y = spawn.y; this.w = 18; this.h = 22;
+          this.vx = 0; this.vy = 0; this.onGround = false; this.dead = false; this.won = false;
+          this.touchingWallDir = 0;
+        }
+
+        collideAndResolve(axis) {
+          const left = Math.floor(this.x / TILE), right = Math.floor((this.x + this.w) / TILE);
+          const top = Math.floor(this.y / TILE), bottom = Math.floor((this.y + this.h) / TILE);
+          let hit = false;
+          
+          if (axis === "x") this.touchingWallDir = 0;
+
+          for (let ty = top - 1; ty <= bottom + 1; ty++) {
+            for (let tx = left - 1; tx <= right + 1; tx++) {
+              const tile = tileAt(tx, ty);
+              
+              // Check Death Block Collision
+              if (tile === "!") {
+                  const tr = { x: tx * TILE, y: ty * TILE, w: TILE, h: TILE };
+                  if (overlaps(this, tr)) {
+                      this.dead = true;
+                  }
+              }
+              
+              if (!isSolid(tile)) continue;
+              
+              const tr = { x: tx * TILE, y: ty * TILE, w: TILE, h: TILE };
+              if (!overlaps(this, tr)) continue;
+              
+              if (tile === "-") {
+                  if (axis === "x" || this.vy <= 0 || keys.down) continue;
+                  const prevBottom = (this.y - this.vy * FIXED_DT) + this.h;
+                  if (prevBottom > tr.y + 0.1) continue; 
+              }
+
+              hit = true;
+              const penL = (this.x + this.w) - tr.x, penR = (tr.x + tr.w) - this.x;
+              const penT = (this.y + this.h) - tr.y, penB = (tr.y + tr.h) - this.y;
+              
+              if (axis === "x") {
+                if (tile === "@") {
+                    if (this.vx > 0) this.touchingWallDir = 1;
+                    if (this.vx < 0) this.touchingWallDir = -1;
+                }
+                if (this.vx > 0) { this.x -= penL; this.vx = 0; } else if (this.vx < 0) { this.x += penR; this.vx = 0; }
+              } else {
+                if (this.vy > 0) { 
+                    this.y -= penT; this.vy = 0; this.onGround = true; 
+                } else if (this.vy < 0 && tile !== "-") { 
+                    this.y += penB; this.vy = 0; 
+                }
+              }
+            }
+          }
+          return hit;
+        }
+
+        update() {
+          if (this.dead || this.won) return;
+
+          let ax = 0;
+          if (keys.right) ax += 1;
+          if (keys.left) ax -= 1;
+
+          const wasGrounded = this.onGround; 
+          this.onGround = false;
+
+          this.vx += ax * MOVE_ACCEL * FIXED_DT;
+          this.vx = Math.max(-MAX_VX, Math.min(MAX_VX, this.vx));
+          
+          if (ax === 0 || (ax < 0 && this.vx > 0) || (ax > 0 && this.vx < 0)) {
+             this.vx *= Math.exp(-FRICTION * FIXED_DT);
+          }
+
+          if (keys.jump && wasGrounded) this.vy = JUMP_VY; 
+          this.vy += GRAV * FIXED_DT;
+
+          // Wall Cling & Jump Logic
+          if (this.touchingWallDir !== 0 && !wasGrounded) {
+              let holdingTowardsWall = (this.touchingWallDir === 1 && keys.right) || (this.touchingWallDir === -1 && keys.left);
+              
+              if (holdingTowardsWall) {
+                  if (this.vy > 60) this.vy = 60; 
+                  
+                  if (keys.jumpPressed) {
+                      this.vy = JUMP_VY * 0.9;
+                      this.vx = -this.touchingWallDir * MAX_VX * 1.5; 
+                  }
+              }
+          }
+
+          this.x += this.vx * FIXED_DT; this.collideAndResolve("x");
+          this.y += this.vy * FIXED_DT; this.collideAndResolve("y");
+
+          if (this.y > WORLD_H + 120) this.dead = true;
+          if (goalRect && overlaps(this, goalRect)) this.won = true;
+          
+          keys.jumpPressed = false;
+        }
+      }
+
+      let player = new Player();
+
+      function parseLevel() {
+        enemies = [];
+        bullets = [];
+        for (let y = 0; y < rows; y++) {
+          for (let x = 0; x < cols; x++) {
+            let ch = LEVEL[y][x];
+            if (ch === "G") goalRect = { x: x * TILE, y: y * TILE - TILE, w: TILE, h: TILE * 2 };
+            if (ch === "S" || ch === "R") enemies.push(new Enemy(x * TILE, y * TILE, ch));
+          }
+        }
+      }
+
+      function resetGame() {
+          if (!isReplaying && currentRun.length > 0) {
+              lastRun = [...currentRun];
+              if (player.won && timeElapsed < bestTime) {
+                  bestTime = timeElapsed;
+                  bestRun = [...currentRun];
+              }
+          }
+
+          player = new Player();
+          parseLevel();
+          timeElapsed = 0;
+          currentRun = [];
+          isReplaying = false;
+          replayIndex = 0;
+          
+          winMsgEl.style.display = 'none';
+          replayMsgEl.style.display = 'none';
+          timerEl.textContent = "0.00s";
+      }
+
+      function updateSimulation() {
+        if (isReplaying) {
+            if (replayIndex < replayFrames.length) {
+                let state = replayFrames[replayIndex];
+                player.x = state.x; player.y = state.y; player.dead = state.dead; player.won = state.won;
+                timeElapsed = replayIndex * FIXED_DT;
+                timerEl.textContent = timeElapsed.toFixed(2) + "s (REPLAY)";
+                replayIndex++;
+            } else { setTimeout(() => resetGame(), 500); }
+        } else {
+            if (player.dead) { resetGame(); return; }
+
+            if (!player.won) {
+                timeElapsed += FIXED_DT;
+                timerEl.textContent = timeElapsed.toFixed(2) + "s";
+            } else { winMsgEl.style.display = 'block'; }
+
+            player.update();
+            currentRun.push({ x: player.x, y: player.y, dead: player.dead, won: player.won });
+            
+            for (let i = bullets.length - 1; i >= 0; i--) {
+                bullets[i].update();
+                if (bullets[i].dead) bullets.splice(i, 1);
+                else if (overlaps(bullets[i], player)) player.dead = true;
+            }
+
+            for (let i = enemies.length - 1; i >= 0; i--) {
+                let e = enemies[i];
+                if (e.dead) continue;
+                e.update();
+                
+                if (overlaps(player, e)) {
+                    if (player.vy > 0 && player.y + player.h < e.y + e.h / 2 + 10) {
+                        e.dead = true;
+                        player.vy = JUMP_VY * 0.8;
+                    } else {
+                        player.dead = true;
+                    }
+                }
+            }
+        }
+
+        const targetCam = player.x - cv.width * 0.35;
+        cameraX += (targetCam - cameraX) * 0.12;
+        cameraX = Math.max(0, Math.min(WORLD_W - cv.width, cameraX));
+      }
+
+      function draw() {
+        ctx.clearRect(0, 0, cv.width, cv.height);
+        ctx.fillStyle = "rgba(255,255,255,0.02)"; ctx.fillRect(0, 0, cv.width, cv.height);
+
+        const cam = cameraX;
+        const startTx = Math.max(0, Math.floor(cam / TILE) - 2);
+        const endTx = Math.min(cols - 1, Math.floor((cam + cv.width) / TILE) + 2);
+        
+        for (let y = 0; y < rows; y++) {
+          for (let x = startTx; x <= endTx; x++) {
+            const ch = LEVEL[y][x]; if (ch === ".") continue;
+            const sx = x * TILE - cam, sy = y * TILE;
+            
+            if (ch === "#") { ctx.fillStyle = "rgba(58,58,85,0.95)"; ctx.fillRect(sx, sy, TILE, TILE); }
+            if (ch === "@") { ctx.fillStyle = "rgba(60, 150, 160, 0.8)"; ctx.fillRect(sx, sy, TILE, TILE); }
+            if (ch === "-") { ctx.fillStyle = "rgba(100,150,200,0.8)"; ctx.fillRect(sx, sy, TILE, TILE / 4); }
+            if (ch === "!") { ctx.fillStyle = "rgba(255, 77, 109, 0.8)"; ctx.fillRect(sx, sy + TILE/2, TILE, TILE/2); } // Draw spikes/lava on lower half
+            if (ch === "G") { ctx.fillStyle = "rgba(69,255,122,0.55)"; ctx.fillRect(sx, sy - TILE, TILE, TILE * 2); }
+          }
+        }
+
+        ctx.fillStyle = "#ffaa00";
+        for (let b of bullets) { ctx.fillRect(b.x - cam, b.y, b.w, b.h); }
+
+        for (let e of enemies) {
+            if (e.dead) continue;
+            ctx.fillStyle = e.type === 'R' ? "rgba(255, 77, 109, 1)" : "rgba(200, 50, 200, 1)";
+            ctx.fillRect(e.x - cam, e.y, e.w, e.h);
+            
+            ctx.fillStyle = "#fff";
+            let eyeX = e.facingLeft ? e.x - cam + 2 : e.x - cam + e.w - 6;
+            ctx.fillRect(eyeX, e.y + 4, 4, 4);
+        }
+
+        if (!isReplaying && bestRun.length > 0) {
+            let ghostFrameIndex = Math.min(currentRun.length, bestRun.length - 1);
+            let ghostState = bestRun[ghostFrameIndex];
+            if (ghostState) {
+                ctx.fillStyle = "rgba(255, 200, 50, 0.4)";
+                ctx.fillRect(ghostState.x - cam, ghostState.y, 18, 22);
+            }
+        }
+
+        if (!player.dead) {
+            ctx.fillStyle = isReplaying ? "rgba(100, 200, 255, 0.85)" : "rgba(124, 255, 215, 1)";
+            ctx.fillRect(player.x - cam, player.y, player.w, player.h);
+        }
+      }
+
+      let lastTime = performance.now();
+      let accumulator = 0;
+
+      function frame(currentTime) {
+        let dt = (currentTime - lastTime) / 1000;
+        if (dt > 0.1) dt = 0.1; 
+        lastTime = currentTime;
+        accumulator += dt;
+
+        while (accumulator >= FIXED_DT) {
+            updateSimulation(); accumulator -= FIXED_DT;
+        }
+
+        draw(); requestAnimationFrame(frame);
+      }
+
+      parseLevel();
+      requestAnimationFrame(frame);
+    })();
+  </script>
+</body>
+</html>

@@ -107,6 +107,8 @@
             <option value="human">Human</option>
             <option value="rule">RuleBased</option>
             <option value="planner">Planner (A*)</option>
+            <option value="ppo">PPO</option>
+            <option value="bcppo">BC+PPO</option>
           </select>
         </label>
         <button id="btnFullscreen">⛶ Fullscreen</button>
@@ -646,12 +648,226 @@
         onEpisodeEnd() {}
       }
 
+
+      const DISCRETE_ACTIONS = [
+        makeAction({}),
+        makeAction({ right: true }),
+        makeAction({ left: true }),
+        makeAction({ jump: true }),
+        makeAction({ right: true, jump: true }),
+        makeAction({ left: true, jump: true }),
+        makeAction({ down: true }),
+      ];
+
+      function actionToIndex(action) {
+        const normalized = makeAction(action);
+        for (let i = 0; i < DISCRETE_ACTIONS.length; i++) {
+          const candidate = DISCRETE_ACTIONS[i];
+          if (candidate.left === normalized.left && candidate.right === normalized.right && candidate.jump === normalized.jump && candidate.down === normalized.down) {
+            return i;
+          }
+        }
+        return 0;
+      }
+
+      function indexToAction(index) {
+        return DISCRETE_ACTIONS[Math.max(0, Math.min(DISCRETE_ACTIONS.length - 1, index))];
+      }
+
+      function softmax(logits) {
+        const maxLogit = Math.max(...logits);
+        const exps = logits.map((v) => Math.exp(v - maxLogit));
+        const sum = exps.reduce((a, b) => a + b, 0) || 1;
+        return exps.map((v) => v / sum);
+      }
+
+      function sampleFromProbs(probs) {
+        const r = Math.random();
+        let cum = 0;
+        for (let i = 0; i < probs.length; i++) {
+          cum += probs[i];
+          if (r <= cum) return i;
+        }
+        return probs.length - 1;
+      }
+
+      function dot(a, b) {
+        let v = 0;
+        for (let i = 0; i < a.length; i++) v += a[i] * b[i];
+        return v;
+      }
+
+      function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+      function extractPolicyFeatures(obs) {
+        const dirToGoal = clamp(obs.goal.dx / (TILE * 20), -1, 1);
+        const goalY = clamp(obs.goal.dy / (TILE * 10), -1, 1);
+        const speedX = clamp(obs.player.vx / MAX_VX, -1, 1);
+        const speedY = clamp(obs.player.vy / 700, -1, 1);
+        const grounded = obs.player.grounded ? 1 : 0;
+        const wall = obs.player.wallClingDir;
+        const gapRight = isGapAhead(obs, 1) ? 1 : 0;
+        const gapLeft = isGapAhead(obs, -1) ? 1 : 0;
+        const wallRight = isWallAhead(obs, 1) ? 1 : 0;
+        const wallLeft = isWallAhead(obs, -1) ? 1 : 0;
+        const deathRight = isDeathAhead(obs, 1) ? 1 : 0;
+        const deathLeft = isDeathAhead(obs, -1) ? 1 : 0;
+        const bulletAlert = isIncomingBullet(obs, 25) ? 1 : 0;
+        const enemyAlert = isEnemyThreat(obs, TILE * 2.5) ? 1 : 0;
+        const nearestEnemyDx = obs.enemies[0] ? clamp(obs.enemies[0].dx / (TILE * 10), -1, 1) : 0;
+        const nearestEnemyDy = obs.enemies[0] ? clamp(obs.enemies[0].dy / (TILE * 8), -1, 1) : 0;
+        const nearestBulletDx = obs.bullets[0] ? clamp(obs.bullets[0].dx / (TILE * 12), -1, 1) : 0;
+
+        return [1, dirToGoal, goalY, speedX, speedY, grounded, wall, gapRight, gapLeft, wallRight, wallLeft, deathRight, deathLeft, bulletAlert, enemyAlert, nearestEnemyDx, nearestEnemyDy, nearestBulletDx];
+      }
+
+      class PPOAgent {
+        constructor(config = {}) {
+          this.actionCount = DISCRETE_ACTIONS.length;
+          this.featureCount = extractPolicyFeatures(buildObservation()).length;
+          this.rolloutSize = config.rolloutSize || 256;
+          this.gamma = config.gamma || 0.992;
+          this.gaeLambda = config.gaeLambda || 0.95;
+          this.clipEpsilon = config.clipEpsilon || 0.2;
+          this.learningRate = config.learningRate || 0.012;
+          this.valueCoef = config.valueCoef || 0.5;
+          this.entropyCoef = config.entropyCoef || 0.01;
+          this.epochs = config.epochs || 3;
+          this.explore = config.explore ?? true;
+          this.rollout = [];
+          this.lastTransition = null;
+          this.policy = Array.from({ length: this.actionCount }, () => Array.from({ length: this.featureCount }, () => (Math.random() - 0.5) * 0.02));
+          this.valueWeights = Array.from({ length: this.featureCount }, () => (Math.random() - 0.5) * 0.02);
+        }
+
+        reset() {
+          this.lastTransition = null;
+        }
+
+        computeLogits(features) { return this.policy.map((weights) => dot(weights, features)); }
+        value(features) { return dot(this.valueWeights, features); }
+
+        act(obs) {
+          const features = extractPolicyFeatures(obs);
+          const logits = this.computeLogits(features);
+          const probs = softmax(logits);
+          const actionIndex = this.explore ? sampleFromProbs(probs) : probs.indexOf(Math.max(...probs));
+          this.lastTransition = {
+            features,
+            actionIndex,
+            logProb: Math.log(Math.max(probs[actionIndex], 1e-8)),
+            value: this.value(features),
+          };
+          return indexToAction(actionIndex);
+        }
+
+        onStep(transition) {
+          if (!this.lastTransition) return;
+          this.rollout.push({ ...this.lastTransition, reward: transition.reward, done: transition.done });
+          if (this.rollout.length >= this.rolloutSize) this.trainOnRollout();
+        }
+
+        discountedAdvantages(steps) {
+          const adv = new Array(steps.length).fill(0);
+          const returns = new Array(steps.length).fill(0);
+          let gae = 0;
+          let nextValue = 0;
+          for (let t = steps.length - 1; t >= 0; t--) {
+            const delta = steps[t].reward + this.gamma * nextValue * (steps[t].done ? 0 : 1) - steps[t].value;
+            gae = delta + this.gamma * this.gaeLambda * (steps[t].done ? 0 : 1) * gae;
+            adv[t] = gae;
+            returns[t] = adv[t] + steps[t].value;
+            nextValue = steps[t].value;
+          }
+          const mean = adv.reduce((a, b) => a + b, 0) / Math.max(1, adv.length);
+          const variance = adv.reduce((a, b) => a + (b - mean) * (b - mean), 0) / Math.max(1, adv.length);
+          const std = Math.sqrt(variance) || 1;
+          for (let i = 0; i < adv.length; i++) adv[i] = (adv[i] - mean) / std;
+          return { adv, returns };
+        }
+
+        trainOnRollout() {
+          if (this.rollout.length < 32) return;
+          const batch = this.rollout.splice(0, this.rollout.length);
+          const { adv, returns } = this.discountedAdvantages(batch);
+          for (let epoch = 0; epoch < this.epochs; epoch++) {
+            for (let i = 0; i < batch.length; i++) {
+              const sample = batch[i];
+              const logits = this.computeLogits(sample.features);
+              const probs = softmax(logits);
+              const ratio = Math.exp(Math.log(Math.max(probs[sample.actionIndex], 1e-8)) - sample.logProb);
+              const clippedRatio = clamp(ratio, 1 - this.clipEpsilon, 1 + this.clipEpsilon);
+              const policyScale = ((ratio > 1 && adv[i] > 0) || (ratio < 1 && adv[i] < 0) ? clippedRatio : ratio) * adv[i];
+
+              for (let a = 0; a < this.actionCount; a++) {
+                const gradLogPi = (a === sample.actionIndex ? 1 : 0) - probs[a];
+                for (let f = 0; f < this.featureCount; f++) {
+                  this.policy[a][f] += this.learningRate * policyScale * gradLogPi * sample.features[f];
+                }
+              }
+
+              const valueError = returns[i] - this.value(sample.features);
+              for (let f = 0; f < this.featureCount; f++) {
+                this.valueWeights[f] += this.learningRate * this.valueCoef * valueError * sample.features[f];
+              }
+            }
+          }
+        }
+
+        onEpisodeEnd() {
+          if (this.rollout.length >= 64) this.trainOnRollout();
+          this.lastTransition = null;
+        }
+      }
+
+      class BCPPOAgent extends PPOAgent {
+        constructor() {
+          super({ learningRate: 0.008, rolloutSize: 192, epochs: 2 });
+          this.bcWarmStarted = false;
+          this.teacherRule = new RuleBasedAgent();
+          this.teacherPlanner = new AStarPlannerAgent();
+        }
+
+        reset(obs) {
+          if (!this.bcWarmStarted) {
+            this.runBehaviorCloningWarmstart(obs);
+            this.bcWarmStarted = true;
+          }
+          super.reset(obs);
+        }
+
+        runBehaviorCloningWarmstart(obs) {
+          const dataset = [];
+          this.teacherRule.reset(obs);
+          this.teacherPlanner.reset(obs);
+          for (let i = 0; i < 800; i++) {
+            const sampleObs = buildObservation();
+            const teacher = (sampleObs.enemies.length > 0 || sampleObs.bullets.length > 0) ? this.teacherRule : this.teacherPlanner;
+            dataset.push({ features: extractPolicyFeatures(sampleObs), actionIndex: actionToIndex(teacher.act(sampleObs)) });
+          }
+
+          for (let epoch = 0; epoch < 8; epoch++) {
+            for (const sample of dataset) {
+              const probs = softmax(this.computeLogits(sample.features));
+              for (let a = 0; a < this.actionCount; a++) {
+                const grad = (a === sample.actionIndex ? 1 : 0) - probs[a];
+                for (let f = 0; f < this.featureCount; f++) {
+                  this.policy[a][f] += 0.02 * grad * sample.features[f];
+                }
+              }
+            }
+          }
+        }
+      }
+
       class AgentManager {
         constructor() {
           this.agents = {
             human: new HumanAgent(),
             rule: new RuleBasedAgent(),
             planner: new AStarPlannerAgent(),
+            ppo: new PPOAgent(),
+            bcppo: new BCPPOAgent(),
           };
           this.activeKey = "human";
         }
@@ -659,8 +875,14 @@
           this.activeKey = this.agents[key] ? key : "human";
           this.agents[this.activeKey].reset(buildObservation());
         }
-        getAction() {
-          return this.agents[this.activeKey].act(buildObservation());
+        getAction(obs = buildObservation()) {
+          return this.agents[this.activeKey].act(obs);
+        }
+        onStep(transition) {
+          this.agents[this.activeKey].onStep?.(transition);
+        }
+        onEpisodeEnd(summary) {
+          this.agents[this.activeKey].onEpisodeEnd?.(summary);
         }
       }
 
@@ -961,6 +1183,7 @@
       function resetGame() {
           if (!isReplaying && currentRun.length > 0) {
               lastRun = [...currentRun];
+              agentManager.onEpisodeEnd({ won: player.won, dead: player.dead, timeElapsed, frames: currentRun.length });
               if (player.won && timeElapsed < bestTime) {
                   bestTime = timeElapsed;
                   bestRun = [...currentRun];
@@ -996,7 +1219,10 @@
                 timerEl.textContent = timeElapsed.toFixed(2) + "s";
             } else { winMsgEl.style.display = 'block'; }
 
-            applyControlAction(agentManager.getAction());
+            const obsBefore = buildObservation();
+            const prevX = player.x;
+            const prevAlive = !player.dead;
+            applyControlAction(agentManager.getAction(obsBefore));
 
             player.update();
             currentRun.push({ x: player.x, y: player.y, dead: player.dead, won: player.won });
@@ -1028,6 +1254,17 @@
                     }
                 }
             }
+            const progressReward = clamp((player.x - prevX) / TILE, -0.15, 0.4);
+            const timePenalty = -0.002;
+            const deathPenalty = (prevAlive && player.dead) ? -1.0 : 0;
+            const winBonus = player.won ? 2.5 : 0;
+            const hazardPenalty = (isIncomingBullet(obsBefore, 20) || isEnemyThreat(obsBefore, TILE * 2.2)) ? -0.003 : 0;
+            agentManager.onStep({
+              reward: progressReward + timePenalty + deathPenalty + winBonus + hazardPenalty,
+              done: player.dead || player.won,
+              observation: obsBefore,
+              nextObservation: buildObservation(),
+            });
         }
 
         const targetCam = player.x - cv.width * 0.35;

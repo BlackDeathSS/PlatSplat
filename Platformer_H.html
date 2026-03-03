@@ -409,25 +409,21 @@
         constructor() {
           this.ruleFallback = new RuleBasedAgent();
           this.plan = [];
-          this.currentEdge = null;
-          this.edgeFrame = 0;
           this.expectedNode = null;
           this.lastPos = null;
           this.stuckFrames = 0;
           this.lastReplanReason = "init";
-          this.debug = { currentNode: "-", plannedActions: [], reason: "init" };
+          this.debug = { currentNode: "-", plannedActions: [], reason: "init", pathNodes: [] };
           this.budgetExceeded = false;
         }
         reset(obs) {
           this.ruleFallback.reset(obs);
           this.plan = [];
-          this.currentEdge = null;
-          this.edgeFrame = 0;
           this.expectedNode = null;
           this.lastPos = obs ? { x: obs.player.x, y: obs.player.y } : null;
           this.stuckFrames = 0;
           this.lastReplanReason = "reset";
-          this.debug = { currentNode: "-", plannedActions: [], reason: "reset" };
+          this.debug = { currentNode: "-", plannedActions: [], reason: "reset", pathNodes: [] };
           this.budgetExceeded = false;
         }
         vxBucket(vx) { return Math.max(-2, Math.min(2, Math.round(vx / 90))); }
@@ -447,8 +443,8 @@
         }
         macroLibrary() {
           return [
-            { name: "run_left", frames: 8, controls: (f) => ({ left: true }) },
-            { name: "run_right", frames: 8, controls: (f) => ({ right: true }) },
+            { name: "run_left", frames: 8, controls: () => ({ left: true }) },
+            { name: "run_right", frames: 8, controls: () => ({ right: true }) },
             { name: "short_jump_left", frames: 10, controls: (f) => ({ left: true, jump: f < 3 }) },
             { name: "short_jump_right", frames: 10, controls: (f) => ({ right: true, jump: f < 3 }) },
             { name: "wall_jump", frames: 10, controls: (f, st) => {
@@ -462,16 +458,12 @@
           for (const b of obs.bullets) {
             const absX = obs.player.x + b.dx;
             const absY = obs.player.y + b.dy;
-            for (let t = 0; t <= horizonFrames; t += 2) {
-              hazards.push({ x: absX + b.vx * FIXED_DT * t, y: absY, w: 8, h: 8, t });
-            }
+            for (let t = 0; t <= horizonFrames; t += 2) hazards.push({ x: absX + b.vx * FIXED_DT * t, y: absY, w: 8, h: 8, t });
           }
           for (const e of obs.enemies) {
             const absX = obs.player.x + e.dx;
             const absY = obs.player.y + e.dy;
-            for (let t = 0; t <= horizonFrames; t += 3) {
-              hazards.push({ x: absX + e.vx * FIXED_DT * t, y: absY + e.vy * FIXED_DT * t, w: 18, h: 22, t });
-            }
+            for (let t = 0; t <= horizonFrames; t += 3) hazards.push({ x: absX + e.vx * FIXED_DT * t, y: absY + e.vy * FIXED_DT * t, w: 18, h: 22, t });
           }
           return hazards;
         }
@@ -551,10 +543,8 @@
         simulateMacro(startState, macro, hazards) {
           let st = { ...startState, dead: false, won: false };
           let hazardPenalty = 0;
-          const actionFrames = [];
           for (let f = 0; f < macro.frames; f++) {
             const action = makeAction(macro.controls(f, st));
-            actionFrames.push(action);
             st = this.simulateStateStep(st, action);
             if (st.dead) return { blocked: true };
             const box = { x: st.x, y: st.y, w: 18, h: 22 };
@@ -566,7 +556,7 @@
               }
             }
           }
-          return { endState: st, gCost: macro.frames + hazardPenalty, blocked: false, actions: actionFrames };
+          return { endState: st, gCost: macro.frames + hazardPenalty, blocked: false };
         }
         planPath(obs, reason = "periodic") {
           const startState = {
@@ -576,7 +566,7 @@
           const hazards = this.predictedHazards(obs, 140);
           const startNode = this.nodeFromState(startState);
           const startKey = this.nodeKey(startNode);
-          const open = [{ key: startKey, state: startState, node: startNode, g: 0, f: this.hScore(startState), parent: null, macro: null, actions: null }];
+          const open = [{ key: startKey, state: startState, node: startNode, g: 0, f: this.hScore(startState), parent: null, macro: null }];
           const closed = new Set();
           const best = new Map([[startKey, 0]]);
           const macros = this.macroLibrary();
@@ -606,7 +596,7 @@
               if (best.has(key) && best.get(key) <= g) continue;
               best.set(key, g);
               const f = g + this.hScore(edge.endState);
-              open.push({ key, state: edge.endState, node, g, f, parent: cur, macro: macro.name, actions: edge.actions });
+              open.push({ key, state: edge.endState, node, g, f, parent: cur, macro: macro.name });
             }
           }
 
@@ -617,30 +607,33 @@
           }
           if (!goalCandidate) {
             this.plan = [];
+            this.expectedNode = null;
+            this.debug.pathNodes = [];
             this.lastReplanReason = `${reason}:no_path`;
             return;
           }
           const path = [];
           let cur = goalCandidate;
           while (cur && cur.parent) {
-            path.push({ macro: cur.macro, actions: cur.actions, expectedNode: cur.node });
+            path.push({ macro: cur.macro, expectedNode: cur.node });
             cur = cur.parent;
           }
           path.reverse();
           this.plan = path;
-          this.currentEdge = null;
-          this.edgeFrame = 0;
+          this.expectedNode = this.plan.length > 0 ? this.plan[0].expectedNode : null;
+          this.debug.pathNodes = [startNode, ...this.plan.map((p) => p.expectedNode)];
           this.lastReplanReason = this.budgetExceeded ? `${reason}:budget` : reason;
         }
         shouldReplan(obs) {
-          if (!this.currentEdge && this.plan.length === 0) return "plan_empty";
+          if (this.plan.length === 0) return "plan_empty";
           const node = this.nodeFromState({ x: obs.player.x, y: obs.player.y, vx: obs.player.vx, vy: obs.player.vy, onGround: obs.player.grounded, touchingWallDir: obs.player.wallClingDir || 0 });
           this.debug.currentNode = this.nodeKey(node);
           if (this.expectedNode) {
             const diverged = Math.abs(node.tileX - this.expectedNode.tileX) > 1 || Math.abs(node.tileY - this.expectedNode.tileY) > 1;
             if (diverged) return "state_diverged";
           }
-          const imminentHazard = obs.bullets.some((b) => Math.abs(b.dx) < TILE * 2.2 && Math.abs(b.dy) < TILE * 1.3) || obs.enemies.some((e) => Math.abs(e.dx) < TILE * 1.5 && Math.abs(e.dy) < TILE * 1.2);
+          const imminentHazard = obs.bullets.some((b) => Math.abs(b.dx) < TILE * 2.2 && Math.abs(b.dy) < TILE * 1.3)
+            || obs.enemies.some((e) => Math.abs(e.dx) < TILE * 1.5 && Math.abs(e.dy) < TILE * 1.2);
           if (imminentHazard) return "hazard_intersection";
           if (this.lastPos) {
             const moved = Math.hypot(obs.player.x - this.lastPos.x, obs.player.y - this.lastPos.y);
@@ -650,9 +643,31 @@
           this.lastPos = { x: obs.player.x, y: obs.player.y };
           return null;
         }
+        ruleNavigateToNode(obs, targetNode) {
+          if (!targetNode) return this.ruleFallback.act(obs);
+          const selfNode = this.nodeFromState({ x: obs.player.x, y: obs.player.y, vx: obs.player.vx, vy: obs.player.vy, onGround: obs.player.grounded, touchingWallDir: obs.player.wallClingDir || 0 });
+          const dxTiles = targetNode.tileX - selfNode.tileX;
+          const dyTiles = targetNode.tileY - selfNode.tileY;
+          const dir = dxTiles < 0 ? -1 : 1;
+          const action = { left: dir < 0, right: dir > 0, jump: false, down: false };
+
+          if (obs.player.grounded && (isWallAhead(obs, dir) || isGapAhead(obs, dir) || isDeathAhead(obs, dir) || dyTiles < -1)) {
+            action.jump = true;
+          }
+          if (obs.player.wallClingDir !== 0 && dyTiles < 0) action.jump = true;
+          if (dyTiles > 1 && obs.player.grounded && !isGapAhead(obs, dir)) action.down = true;
+
+          if (shouldEvadeMidairEnemy(obs, dir)) {
+            action.left = dir > 0;
+            action.right = dir < 0;
+          }
+          if (isIncomingBullet(obs, 18) && obs.player.grounded) action.jump = true;
+          return makeAction(action);
+        }
         fallbackAction(obs) {
           if (isIncomingBullet(obs, 20) || isEnemyThreat(obs, TILE * 1.6)) {
-            return makeAction({ jump: obs.player.grounded, left: obs.goal.dx > 0, right: obs.goal.dx < 0 });
+            const evadeDir = obs.goal.dx > 0 ? -1 : 1;
+            return makeAction({ jump: obs.player.grounded, left: evadeDir < 0, right: evadeDir > 0 });
           }
           return this.ruleFallback.act(obs);
         }
@@ -665,26 +680,23 @@
             return this.fallbackAction(obs);
           }
 
-          if (!this.currentEdge) {
-            this.currentEdge = this.plan.shift() || null;
-            this.edgeFrame = 0;
-            if (this.currentEdge) this.expectedNode = this.currentEdge.expectedNode;
+          const currentNode = this.nodeFromState({ x: obs.player.x, y: obs.player.y, vx: obs.player.vx, vy: obs.player.vy, onGround: obs.player.grounded, touchingWallDir: obs.player.wallClingDir || 0 });
+          while (this.plan.length > 0) {
+            const target = this.plan[0].expectedNode;
+            const reached = Math.abs(currentNode.tileX - target.tileX) <= 1 && Math.abs(currentNode.tileY - target.tileY) <= 1;
+            if (!reached) break;
+            this.plan.shift();
           }
+          this.expectedNode = this.plan.length > 0 ? this.plan[0].expectedNode : null;
+          this.debug.plannedActions = this.plan.slice(0, 4).map((p) => p.macro);
+          this.debug.pathNodes = [currentNode, ...this.plan.slice(0, 18).map((p) => p.expectedNode)];
+          this.debug.reason = this.lastReplanReason;
 
-          if (!this.currentEdge) {
-            this.debug.reason = "no_plan_fallback";
+          if (!this.expectedNode) {
+            this.debug.reason = "plan_complete_fallback";
             return this.fallbackAction(obs);
           }
-
-          const action = this.currentEdge.actions[Math.min(this.edgeFrame, this.currentEdge.actions.length - 1)] || {};
-          this.edgeFrame++;
-          if (this.edgeFrame >= this.currentEdge.actions.length) {
-            this.currentEdge = null;
-            this.edgeFrame = 0;
-          }
-          this.debug.plannedActions = [this.currentEdge?.macro || "next", ...this.plan.slice(0, 3).map((p) => p.macro)].filter(Boolean);
-          this.debug.reason = this.lastReplanReason;
-          return makeAction(action);
+          return this.ruleNavigateToNode(obs, this.expectedNode);
         }
         onStep() {}
         onEpisodeEnd() {}
@@ -711,7 +723,7 @@
           if (agent && agent.onStep) agent.onStep(transition);
           const debug = agent && agent.debug ? agent.debug : null;
           aiDebugEl.textContent = debug
-            ? `node=${debug.currentNode || "-"} | plan=${(debug.plannedActions || []).join(" > ") || "-"} | replan=${debug.reason || "-"}`
+            ? `node=${debug.currentNode || "-"} | plan=${(debug.plannedActions || []).join(" > ") || "-"} | nodes=${(debug.pathNodes || []).length} | replan=${debug.reason || "-"}`
             : `agent=${this.activeKey}`;
         }
         onEpisodeEnd(summary) {
@@ -1141,6 +1153,36 @@
             ctx.fillStyle = "#fff";
             let eyeX = e.facingLeft ? e.x - cam + 2 : e.x - cam + e.w - 6;
             ctx.fillRect(eyeX, e.y + 4, 4, 4);
+        }
+
+
+        if (!isReplaying && agentManager.activeKey === "planner") {
+            const plannerAgent = agentManager.agents.planner;
+            const pathNodes = plannerAgent && plannerAgent.debug ? (plannerAgent.debug.pathNodes || []) : [];
+            if (pathNodes.length > 0) {
+                ctx.save();
+                ctx.strokeStyle = "rgba(100, 200, 255, 0.75)";
+                ctx.fillStyle = "rgba(100, 200, 255, 0.9)";
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                for (let i = 0; i < pathNodes.length; i++) {
+                    const n = pathNodes[i];
+                    const px = n.tileX * TILE + TILE * 0.5 - cam;
+                    const py = n.tileY * TILE + TILE * 0.5;
+                    if (i === 0) ctx.moveTo(px, py);
+                    else ctx.lineTo(px, py);
+                }
+                ctx.stroke();
+                for (let i = 0; i < pathNodes.length; i++) {
+                    const n = pathNodes[i];
+                    const px = n.tileX * TILE + TILE * 0.5 - cam;
+                    const py = n.tileY * TILE + TILE * 0.5;
+                    ctx.beginPath();
+                    ctx.arc(px, py, i === 0 ? 5 : 3, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+                ctx.restore();
+            }
         }
 
         if (!isReplaying && bestRun.length > 0) {

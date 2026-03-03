@@ -245,6 +245,15 @@
       function isEnemyThreat(obs, radius = TILE * 2.5) {
         return obs.enemies.some((e) => Math.abs(e.dx) < radius && Math.abs(e.dy) < TILE * 1.5);
       }
+      function shouldAvoidEnemyLanding(obs, dir = 1) {
+        const dangerForward = obs.enemies.some((e) => e.dy > 6 && e.dy < TILE * 2.8 && e.dx * dir > 0 && Math.abs(e.dx) < TILE * 2.8);
+        const dangerUnder = obs.enemies.some((e) => e.dy > 0 && e.dy < TILE * 2.2 && Math.abs(e.dx) < TILE * 1.2);
+        return dangerForward || dangerUnder;
+      }
+      function shouldEvadeMidairEnemy(obs, dir = 1) {
+        if (obs.player.grounded) return false;
+        return obs.enemies.some((e) => e.dy > -6 && e.dy < TILE * 2.5 && Math.abs(e.dx) < TILE * 1.8 && e.dx * dir > -TILE * 0.5);
+      }
       function shouldWallJump(obs, dir = 1) {
         if (obs.player.wallClingDir === 0) return false;
         return obs.goal.dy < 20 || isWallAhead(obs, dir) || isDeathAhead(obs, dir);
@@ -334,6 +343,17 @@
           if (isEnemyThreat(obs, TILE * 2.2) && obs.player.grounded) action.jump = true;
           if (isDeathAhead(obs, dir) && obs.player.grounded) action.jump = true;
           if ((isGapAhead(obs, dir) || isWallAhead(obs, dir)) && obs.player.grounded) action.jump = true;
+
+          if (shouldAvoidEnemyLanding(obs, dir) && obs.player.grounded) {
+            action.jump = true;
+            action.left = dir > 0;
+            action.right = dir < 0;
+          }
+
+          if (shouldEvadeMidairEnemy(obs, dir)) {
+            action.left = dir > 0;
+            action.right = dir < 0;
+          }
 
           if (shouldWallJump(obs, dir)) {
             const pushAwayFromWall = !hasLowCeiling(obs) || obs.player.vy > 80;

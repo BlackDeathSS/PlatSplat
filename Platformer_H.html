@@ -376,8 +376,8 @@
 
           if (shouldWallJump(obs, dir)) {
             const pushAwayFromWall = !hasLowCeiling(obs) || obs.player.vy > 80;
-            action.left = pushAwayFromWall ? obs.player.wallClingDir < 0 : obs.player.wallClingDir > 0;
-            action.right = pushAwayFromWall ? obs.player.wallClingDir > 0 : obs.player.wallClingDir < 0;
+            action.left = pushAwayFromWall ? obs.player.wallClingDir > 0 : obs.player.wallClingDir < 0;
+            action.right = pushAwayFromWall ? obs.player.wallClingDir < 0 : obs.player.wallClingDir > 0;
             if (this.wallJumpCooldown <= 0 && pushAwayFromWall) {
               action.jump = true;
               this.wallJumpCooldown = 6;

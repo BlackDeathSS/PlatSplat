@@ -254,6 +254,21 @@
         if (obs.player.grounded) return false;
         return obs.enemies.some((e) => e.dy > -6 && e.dy < TILE * 2.5 && Math.abs(e.dx) < TILE * 1.8 && e.dx * dir > -TILE * 0.5);
       }
+      function directionRiskScore(obs, dir = 1) {
+        let score = 0;
+        if (isDeathAhead(obs, dir)) score += 100;
+        if (isGapAhead(obs, dir) && obs.player.grounded) score += 35;
+        if (isWallAhead(obs, dir) && obs.player.grounded) score += 8;
+        const enemyRisk = obs.enemies.some((e) => e.dy > -TILE * 0.6 && e.dy < TILE * 2.2 && e.dx * dir > 0 && Math.abs(e.dx) < TILE * 2.5);
+        if (enemyRisk) score += 70;
+        return score;
+      }
+      function chooseSaferDirection(obs, preferredDir = 1) {
+        const preferredRisk = directionRiskScore(obs, preferredDir);
+        const oppositeDir = -preferredDir;
+        const oppositeRisk = directionRiskScore(obs, oppositeDir);
+        return oppositeRisk + 8 < preferredRisk ? oppositeDir : preferredDir;
+      }
       function shouldWallJump(obs, dir = 1) {
         if (obs.player.wallClingDir === 0) return false;
         return obs.goal.dy < 20 || isWallAhead(obs, dir) || isDeathAhead(obs, dir);
@@ -333,11 +348,15 @@
           }
 
           if (isIncomingBullet(obs, 30)) {
+            const nearestBullet = obs.bullets
+              .filter((b) => b.dx > -30 && b.dx < 220 && Math.abs(b.dy) < 40)
+              .sort((a, b) => Math.abs(a.dx) - Math.abs(b.dx))[0];
+            const retreatFromBullet = nearestBullet ? (nearestBullet.dx > 0 ? -1 : 1) : -dir;
+            const safeRetreatDir = chooseSaferDirection(obs, retreatFromBullet);
+
+            action.left = safeRetreatDir < 0;
+            action.right = safeRetreatDir > 0;
             if (obs.player.grounded) action.jump = true;
-            else {
-              action.left = true;
-              action.right = false;
-            }
           }
 
           if (isEnemyThreat(obs, TILE * 2.2) && obs.player.grounded) action.jump = true;

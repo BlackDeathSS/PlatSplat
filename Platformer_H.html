@@ -60,6 +60,15 @@
         display: flex; gap: 12px; justify-content: center; margin-top: 5px;
     }
 
+    .debug-panel {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      min-height: 18px;
+      text-align: center;
+    }
+
     button {
       appearance: none; border: none; border-radius: 12px; padding: 12px 18px; font-weight: 800;
       background: rgba(124, 255, 215, 0.12); color: var(--accent); border: 1px solid rgba(124, 255, 215, 0.30); 
@@ -114,6 +123,7 @@
         <button id="btnReplayLast" style="color:var(--muted); border-color:var(--muted); background:rgba(255,255,255,0.05);">▶ Replay Last Run</button>
         <button id="btnReplayBest" style="color:var(--ghost); border-color:rgba(255,200,50,0.4); background:rgba(255,200,50,0.1);">★ Replay Best Win</button>
     </div>
+    <div class="debug-panel" id="debugText">Debug: off (press O)</div>
   </div>
 
   <script>
@@ -126,6 +136,7 @@
       const pauseMsgEl = document.getElementById("pauseMsg");
       const agentSelectEl = document.getElementById("agentSelect");
       const pauseBtnEl = document.getElementById("btnPause");
+      const debugTextEl = document.getElementById("debugText");
 
       // @ = Cling Wall, S = Shooter Enemy, R = Runner Enemy, G = Goal, ! = Death Block     
       const LEVEL = [
@@ -157,6 +168,7 @@
       let bestTime = Infinity;
       let isReplaying = false;
       let isPaused = false;
+      let debugEnabled = false;
       let replayFrames = [];
       let replayIndex = 0;
 
@@ -313,30 +325,54 @@
       class RuleBasedAgent {
         constructor() {
           this.wallJumpCooldown = 0;
+          this.jumpCooldown = 0;
           this.stagnationFrames = 0;
           this.escapeFrames = 0;
+          this.baitCooldown = 0;
           this.wallStuckFrames = 0;
           this.unstickFrames = 0;
+          this.committedDir = 1;
+          this.dirCommitFrames = 0;
           this.baitState = "none";
           this.baitFrames = 0;
+          this.lastDecision = "init";
           this.lastPos = null;
           this.lastGoalDistance = null;
           this.preferredDir = 1;
         }
         reset(obs) {
           this.wallJumpCooldown = 0;
+          this.jumpCooldown = 0;
           this.stagnationFrames = 0;
           this.escapeFrames = 0;
+          this.baitCooldown = 0;
           this.wallStuckFrames = 0;
           this.unstickFrames = 0;
+          this.committedDir = 1;
+          this.dirCommitFrames = 0;
           this.baitState = "none";
           this.baitFrames = 0;
+          this.lastDecision = "reset";
           this.lastPos = obs ? { x: obs.player.x, y: obs.player.y } : null;
           this.lastGoalDistance = obs ? goalDistanceScore(obs) : null;
           this.preferredDir = 1;
         }
         act(obs) {
           const action = { left: false, right: false, jump: false, down: false };
+
+          if (this.jumpCooldown > 0) this.jumpCooldown--;
+          if (this.dirCommitFrames > 0) this.dirCommitFrames--;
+          if (this.baitCooldown > 0) this.baitCooldown--;
+
+          const tryGroundJump = (reason) => {
+            if (obs.player.grounded && this.jumpCooldown <= 0) {
+              action.jump = true;
+              this.jumpCooldown = 12;
+              this.lastDecision = reason;
+              return true;
+            }
+            return false;
+          };
 
           if (this.lastPos) {
             const moved = Math.hypot(obs.player.x - this.lastPos.x, obs.player.y - this.lastPos.y);
@@ -368,8 +404,12 @@
             this.preferredDir = -obs.player.wallClingDir;
           }
 
-          let dir = obs.goal.dx < -10 ? -1 : 1;
-          if (this.escapeFrames > 0) dir = this.preferredDir;
+          const desiredDir = this.escapeFrames > 0 ? this.preferredDir : (obs.goal.dx < -10 ? -1 : 1);
+          if (this.dirCommitFrames <= 0 || this.committedDir !== desiredDir) {
+            this.committedDir = desiredDir;
+            this.dirCommitFrames = 14;
+          }
+          let dir = this.committedDir;
 
           action.left = dir < 0;
           action.right = dir > 0;
@@ -379,13 +419,15 @@
             action.left = obs.player.wallClingDir > 0;
             action.right = obs.player.wallClingDir < 0;
             action.jump = false;
+            this.lastDecision = "unstick";
             return makeAction(action);
           }
 
           const closeEnemyAhead = getClosestEnemyAhead(obs, dir, 6);
-          if (this.baitState === "none" && isOnDropPlatform(obs) && hasDropSpace(obs) && isEnemyApproaching(closeEnemyAhead, dir)) {
+          if (this.baitState === "none" && this.baitCooldown <= 0 && isOnDropPlatform(obs) && hasDropSpace(obs) && isEnemyApproaching(closeEnemyAhead, dir)) {
             this.baitState = "jumpBait";
             this.baitFrames = 55;
+            this.lastDecision = "bait:start";
           }
 
           if (this.baitState !== "none") {
@@ -397,13 +439,15 @@
             action.right = false;
 
             if (this.baitState === "jumpBait") {
-              if (obs.player.grounded) action.jump = true;
+              tryGroundJump("bait:probe-jump");
               if (!obs.player.grounded || enemyNear) this.baitState = "dropWait";
             } else if (this.baitState === "dropWait") {
               action.down = true;
+              this.lastDecision = "bait:drop";
               if (!isOnDropPlatform(obs)) this.baitState = "holdUnder";
             } else if (this.baitState === "holdUnder") {
               action.down = true;
+              this.lastDecision = "bait:wait-under";
               const enemyPassed = !baitEnemy || baitEnemy.dx * dir < -TILE * 0.9;
               if (enemyPassed && obs.player.grounded) {
                 this.baitState = "resume";
@@ -412,12 +456,14 @@
             } else if (this.baitState === "resume") {
               action.left = dir < 0;
               action.right = dir > 0;
-              if (obs.player.grounded) action.jump = true;
+              tryGroundJump("bait:resume-jump");
+              this.lastDecision = "bait:resume-run";
             }
 
             if (this.baitFrames <= 0) {
               this.baitState = "none";
               this.baitFrames = 0;
+              this.baitCooldown = 36;
             }
             if (this.baitState !== "none") return makeAction(action);
           }
@@ -431,22 +477,24 @@
 
             action.left = safeRetreatDir < 0;
             action.right = safeRetreatDir > 0;
-            if (obs.player.grounded) action.jump = true;
+            tryGroundJump("bullet:jump");
           }
 
-          if (isEnemyThreat(obs, TILE * 2.2) && obs.player.grounded) action.jump = true;
-          if (isDeathAhead(obs, dir) && obs.player.grounded) action.jump = true;
-          if ((isGapAhead(obs, dir) || isWallAhead(obs, dir)) && obs.player.grounded) action.jump = true;
+          if (isEnemyThreat(obs, TILE * 2.2)) tryGroundJump("enemy-threat:jump");
+          if (isDeathAhead(obs, dir)) tryGroundJump("death-ahead:jump");
+          if (isGapAhead(obs, dir) || isWallAhead(obs, dir)) tryGroundJump("gap-or-wall:jump");
 
           if (shouldAvoidEnemyLanding(obs, dir) && obs.player.grounded) {
-            action.jump = true;
+            tryGroundJump("avoid-landing:jump");
             action.left = dir > 0;
             action.right = dir < 0;
+            this.lastDecision = "avoid-landing:reverse";
           }
 
           if (shouldEvadeMidairEnemy(obs, dir)) {
             action.left = dir > 0;
             action.right = dir < 0;
+            this.lastDecision = "midair-evade";
           }
 
           if (shouldWallJump(obs, dir)) {
@@ -456,10 +504,12 @@
             if (this.wallJumpCooldown <= 0 && pushAwayFromWall) {
               action.jump = true;
               this.wallJumpCooldown = 6;
+              this.lastDecision = "wall-jump";
             }
           }
 
           this.wallJumpCooldown--;
+          if (this.lastDecision === "reset") this.lastDecision = "run";
           return makeAction(action);
         }
         onStep() {}
@@ -512,6 +562,7 @@
           }
           if (e.key === 's' || e.key === 'ArrowDown') keys.down = true;
           if (e.key === 'p' || e.key === 'P') togglePause();
+          if (e.key === 'o' || e.key === 'O') debugEnabled = !debugEnabled;
           if (e.key === 'r' || e.key === 'R') resetGame();
       }, { passive: false });
 
@@ -863,6 +914,15 @@
         const targetCam = player.x - cv.width * 0.35;
         cameraX += (targetCam - cameraX) * 0.12;
         cameraX = Math.max(0, Math.min(WORLD_W - cv.width, cameraX));
+
+        if (debugEnabled && agentManager.activeKey === 'rule') {
+          const rule = agentManager.agents.rule;
+          debugTextEl.textContent = `t=${timeElapsed.toFixed(2)}s | bait=${rule.baitState}(${rule.baitFrames}) | dir=${rule.committedDir} lock=${rule.dirCommitFrames} | jumpCD=${rule.jumpCooldown} | ${rule.lastDecision}`;
+        } else if (debugEnabled) {
+          debugTextEl.textContent = `t=${timeElapsed.toFixed(2)}s | agent=${agentManager.activeKey}`;
+        } else {
+          debugTextEl.textContent = 'Debug: off (press O)';
+        }
       }
 
       function draw() {

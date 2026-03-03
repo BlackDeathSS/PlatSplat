@@ -249,6 +249,9 @@
         if (obs.player.wallClingDir === 0) return false;
         return obs.goal.dy < 20 || isWallAhead(obs, dir) || isDeathAhead(obs, dir);
       }
+      function hasLowCeiling(obs) {
+        return isSolidCode(getObsTile(obs, 0, -1)) || isSolidCode(getObsTile(obs, 1, -1)) || isSolidCode(getObsTile(obs, -1, -1));
+      }
 
       class HumanAgent {
         reset() {}
@@ -262,6 +265,8 @@
           this.wallJumpCooldown = 0;
           this.stagnationFrames = 0;
           this.escapeFrames = 0;
+          this.wallStuckFrames = 0;
+          this.unstickFrames = 0;
           this.lastPos = null;
           this.preferredDir = 1;
         }
@@ -269,6 +274,8 @@
           this.wallJumpCooldown = 0;
           this.stagnationFrames = 0;
           this.escapeFrames = 0;
+          this.wallStuckFrames = 0;
+          this.unstickFrames = 0;
           this.lastPos = obs ? { x: obs.player.x, y: obs.player.y } : null;
           this.preferredDir = 1;
         }
@@ -289,11 +296,32 @@
 
           if (this.escapeFrames > 0) this.escapeFrames--;
 
+          if (obs.player.wallClingDir !== 0 && hasLowCeiling(obs) && Math.abs(obs.player.vy) < 110) {
+            this.wallStuckFrames++;
+          } else {
+            this.wallStuckFrames = 0;
+          }
+
+          if (this.wallStuckFrames > 16) {
+            this.wallStuckFrames = 0;
+            this.unstickFrames = 24;
+            this.escapeFrames = Math.max(this.escapeFrames, 28);
+            this.preferredDir = -obs.player.wallClingDir;
+          }
+
           let dir = obs.goal.dx < -10 ? -1 : 1;
           if (this.escapeFrames > 0) dir = this.preferredDir;
 
           action.left = dir < 0;
           action.right = dir > 0;
+
+          if (this.unstickFrames > 0) {
+            this.unstickFrames--;
+            action.left = obs.player.wallClingDir > 0;
+            action.right = obs.player.wallClingDir < 0;
+            action.jump = false;
+            return makeAction(action);
+          }
 
           if (isIncomingBullet(obs, 30)) {
             if (obs.player.grounded) action.jump = true;
@@ -308,9 +336,10 @@
           if ((isGapAhead(obs, dir) || isWallAhead(obs, dir)) && obs.player.grounded) action.jump = true;
 
           if (shouldWallJump(obs, dir)) {
-            action.left = obs.player.wallClingDir < 0;
-            action.right = obs.player.wallClingDir > 0;
-            if (this.wallJumpCooldown <= 0) {
+            const pushAwayFromWall = !hasLowCeiling(obs) || obs.player.vy > 80;
+            action.left = pushAwayFromWall ? obs.player.wallClingDir < 0 : obs.player.wallClingDir > 0;
+            action.right = pushAwayFromWall ? obs.player.wallClingDir > 0 : obs.player.wallClingDir < 0;
+            if (this.wallJumpCooldown <= 0 && pushAwayFromWall) {
               action.jump = true;
               this.wallJumpCooldown = 6;
             }

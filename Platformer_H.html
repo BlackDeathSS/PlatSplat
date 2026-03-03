@@ -101,6 +101,13 @@
     </div>
 
     <div class="controls-row">
+        <label style="display:flex; align-items:center; gap:8px; color:var(--muted); font-size:14px;">
+          Agent
+          <select id="agentSelect" style="background:#1a1a2b; color:var(--fg); border:1px solid rgba(255,255,255,0.2); border-radius:8px; padding:6px 8px;">
+            <option value="human">Human</option>
+            <option value="rule">RuleBased</option>
+          </select>
+        </label>
         <button id="btnFullscreen">⛶ Fullscreen</button>
         <button id="btnReplayLast" style="color:var(--muted); border-color:var(--muted); background:rgba(255,255,255,0.05);">▶ Replay Last Run</button>
         <button id="btnReplayBest" style="color:var(--ghost); border-color:rgba(255,200,50,0.4); background:rgba(255,200,50,0.1);">★ Replay Best Win</button>
@@ -114,6 +121,7 @@
       const timerEl = document.getElementById("timer");
       const winMsgEl = document.getElementById("winMsg");
       const replayMsgEl = document.getElementById("replayMsg");
+      const agentSelectEl = document.getElementById("agentSelect");
 
       // @ = Cling Wall, S = Shooter Enemy, R = Runner Enemy, G = Goal, ! = Death Block     
       const LEVEL = [
@@ -148,6 +156,164 @@
       let replayIndex = 0;
 
       const keys = { left: false, right: false, jump: false, down: false, jumpPressed: false };
+      const aiControlState = { left: false, right: false, jump: false, down: false };
+
+      function makeAction(action = {}) {
+        const left = !!action.left;
+        const right = !!action.right;
+        return {
+          left: left && !right,
+          right: right && !left,
+          jump: !!action.jump,
+          down: !!action.down,
+        };
+      }
+
+      function tileCode(ch) {
+        if (ch === ".") return 0;
+        if (ch === "#") return 1;
+        if (ch === "-") return 2;
+        if (ch === "@") return 3;
+        if (ch === "!") return 4;
+        if (ch === "G") return 5;
+        if (ch === "S") return 6;
+        if (ch === "R") return 7;
+        return -1;
+      }
+
+      function buildObservation() {
+        const playerCenterX = player.x + player.w / 2;
+        const playerCenterY = player.y + player.h / 2;
+        const tileX = Math.floor(playerCenterX / TILE);
+        const tileY = Math.floor(playerCenterY / TILE);
+        const halfW = 7;
+        const halfH = 5;
+        const localTiles = [];
+        for (let dy = -halfH; dy <= halfH; dy++) {
+          const row = [];
+          for (let dx = -halfW; dx <= halfW; dx++) {
+            row.push(tileCode(tileAt(tileX + dx, tileY + dy)));
+          }
+          localTiles.push(row);
+        }
+
+        const nearestEnemies = enemies
+          .filter((e) => !e.dead)
+          .map((e) => ({ dx: e.x - player.x, dy: e.y - player.y, type: e.type, vx: e.vx, vy: e.vy }))
+          .sort((a, b) => (a.dx * a.dx + a.dy * a.dy) - (b.dx * b.dx + b.dy * b.dy))
+          .slice(0, 3);
+        const nearestBullets = bullets
+          .map((b) => ({ dx: b.x - player.x, dy: b.y - player.y, vx: b.vx, vy: 0 }))
+          .sort((a, b) => (a.dx * a.dx + a.dy * a.dy) - (b.dx * b.dx + b.dy * b.dy))
+          .slice(0, 4);
+
+        return {
+          schema: "obs_v1",
+          player: {
+            x: player.x, y: player.y, vx: player.vx, vy: player.vy,
+            grounded: player.onGround, wallClingDir: player.touchingWallDir, alive: !player.dead,
+          },
+          localTiles,
+          enemies: nearestEnemies,
+          bullets: nearestBullets,
+          goal: goalRect ? { dx: goalRect.x - player.x, dy: goalRect.y - player.y } : { dx: 0, dy: 0 },
+        };
+      }
+
+      function isSolidCode(code) { return code === 1 || code === 2 || code === 3; }
+      function isGapAhead(obs) {
+        const centerY = Math.floor(obs.localTiles.length / 2);
+        const centerX = Math.floor(obs.localTiles[0].length / 2);
+        const ahead = centerX + 2;
+        const belowAhead = centerY + 2;
+        if (!obs.player.grounded) return false;
+        return ahead < obs.localTiles[0].length && belowAhead < obs.localTiles.length && !isSolidCode(obs.localTiles[belowAhead][ahead]);
+      }
+      function isWallAhead(obs) {
+        const centerY = Math.floor(obs.localTiles.length / 2);
+        const centerX = Math.floor(obs.localTiles[0].length / 2);
+        const ahead = centerX + 1;
+        return isSolidCode(obs.localTiles[centerY][ahead]) || isSolidCode(obs.localTiles[Math.max(0, centerY - 1)][ahead]);
+      }
+      function isIncomingBullet(obs, horizonFrames = 25) {
+        return obs.bullets.some((b) => b.dx > -18 && b.dx < 180 && Math.abs(b.dy) < 22 && b.vx < 0 && Math.abs(b.dx / b.vx) < horizonFrames * FIXED_DT);
+      }
+      function isEnemyThreat(obs, radius = TILE * 2.5) {
+        return obs.enemies.some((e) => Math.abs(e.dx) < radius && Math.abs(e.dy) < TILE * 1.5);
+      }
+      function shouldWallJump(obs) {
+        return obs.player.wallClingDir !== 0 && obs.goal.dy < -10;
+      }
+
+      class HumanAgent {
+        reset() {}
+        act() { return makeAction(keys); }
+        onStep() {}
+        onEpisodeEnd() {}
+      }
+
+      class RuleBasedAgent {
+        constructor() { this.wallJumpCooldown = 0; }
+        reset() { this.wallJumpCooldown = 0; }
+        act(obs) {
+          const action = { left: false, right: true, jump: false, down: false };
+          if (obs.goal.dx < -10) {
+            action.left = true; action.right = false;
+          }
+
+          if (isIncomingBullet(obs, 30)) {
+            if (obs.player.grounded) action.jump = true;
+            else { action.left = true; action.right = false; }
+          }
+
+          if (isEnemyThreat(obs, TILE * 2.2) && obs.player.grounded) action.jump = true;
+          if ((isGapAhead(obs) || isWallAhead(obs)) && obs.player.grounded) action.jump = true;
+
+          if (shouldWallJump(obs) && this.wallJumpCooldown <= 0) {
+            action.jump = true;
+            action.left = obs.player.wallClingDir > 0;
+            action.right = obs.player.wallClingDir < 0;
+            this.wallJumpCooldown = 10;
+          }
+          this.wallJumpCooldown--;
+          return makeAction(action);
+        }
+        onStep() {}
+        onEpisodeEnd() {}
+      }
+
+      class AgentManager {
+        constructor() {
+          this.agents = { human: new HumanAgent(), rule: new RuleBasedAgent() };
+          this.activeKey = "human";
+        }
+        setActive(key) {
+          this.activeKey = this.agents[key] ? key : "human";
+          this.agents[this.activeKey].reset(buildObservation());
+        }
+        getAction() {
+          return this.agents[this.activeKey].act(buildObservation());
+        }
+      }
+
+      const agentManager = new AgentManager();
+      agentSelectEl.addEventListener("change", () => {
+        agentManager.setActive(agentSelectEl.value);
+        resetGame();
+      });
+
+      function applyControlAction(action) {
+        const nextAction = makeAction(action);
+        keys.left = nextAction.left;
+        keys.right = nextAction.right;
+        keys.down = nextAction.down;
+        keys.jumpPressed = !aiControlState.jump && nextAction.jump;
+        keys.jump = nextAction.jump;
+        aiControlState.left = nextAction.left;
+        aiControlState.right = nextAction.right;
+        aiControlState.jump = nextAction.jump;
+        aiControlState.down = nextAction.down;
+      }
 
       window.addEventListener('keydown', (e) => {
           if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
@@ -454,6 +620,8 @@
                 timeElapsed += FIXED_DT;
                 timerEl.textContent = timeElapsed.toFixed(2) + "s";
             } else { winMsgEl.style.display = 'block'; }
+
+            applyControlAction(agentManager.getAction());
 
             player.update();
             currentRun.push({ x: player.x, y: player.y, dead: player.dead, won: player.won });

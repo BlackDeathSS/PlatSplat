@@ -289,6 +289,24 @@
         if (!enemy) return false;
         return enemy.vx * dir < -5;
       }
+      function isOneWayLedgeAhead(obs, dir = 1) {
+        const ahead = getObsTile(obs, dir, 0);
+        const aboveAhead = getObsTile(obs, dir, -1);
+        const twoAheadAbove = getObsTile(obs, dir * 2, -1);
+        return ahead === 2 || aboveAhead === 2 || twoAheadAbove === 2;
+      }
+      function getGuardEnemy(obs, dir = 1) {
+        const candidates = obs.enemies
+          .filter((e) => e.dx * dir > TILE * 0.8 && e.dx * dir < TILE * 5.6 && e.dy > -TILE * 1.3 && e.dy < TILE * 0.9)
+          .sort((a, b) => Math.abs(a.dx) - Math.abs(b.dx));
+        return candidates[0] || null;
+      }
+      function isGuardedLedgeSituation(obs, dir = 1) {
+        if (!obs.player.grounded) return false;
+        if (!isWallAhead(obs, dir)) return false;
+        if (!isOneWayLedgeAhead(obs, dir)) return false;
+        return !!getGuardEnemy(obs, dir);
+      }
       function directionRiskScore(obs, dir = 1) {
         let score = 0;
         if (isDeathAhead(obs, dir)) score += 100;
@@ -329,6 +347,7 @@
           this.stagnationFrames = 0;
           this.escapeFrames = 0;
           this.baitCooldown = 0;
+          this.guardHoldFrames = 0;
           this.wallStuckFrames = 0;
           this.unstickFrames = 0;
           this.committedDir = 1;
@@ -346,6 +365,7 @@
           this.stagnationFrames = 0;
           this.escapeFrames = 0;
           this.baitCooldown = 0;
+          this.guardHoldFrames = 0;
           this.wallStuckFrames = 0;
           this.unstickFrames = 0;
           this.committedDir = 1;
@@ -374,11 +394,15 @@
             return false;
           };
 
+          let dir = this.committedDir;
+
           if (this.lastPos) {
             const moved = Math.hypot(obs.player.x - this.lastPos.x, obs.player.y - this.lastPos.y);
             const currentGoalDistance = goalDistanceScore(obs);
             const goalImprovement = this.lastGoalDistance == null ? 0 : this.lastGoalDistance - currentGoalDistance;
-            this.stagnationFrames = (moved < 1.2 || goalImprovement < 1.1) ? this.stagnationFrames + 1 : 0;
+            const stagnating = moved < 1.2 || goalImprovement < 1.1;
+            const guardedLedge = isGuardedLedgeSituation(obs, dir);
+            this.stagnationFrames = (stagnating && !guardedLedge) ? this.stagnationFrames + 1 : 0;
             this.lastGoalDistance = currentGoalDistance;
           }
           this.lastPos = { x: obs.player.x, y: obs.player.y };
@@ -409,7 +433,7 @@
             this.committedDir = desiredDir;
             this.dirCommitFrames = 14;
           }
-          let dir = this.committedDir;
+          dir = this.committedDir;
 
           action.left = dir < 0;
           action.right = dir > 0;
@@ -422,6 +446,42 @@
             this.lastDecision = "unstick";
             return makeAction(action);
           }
+
+          if (isGuardedLedgeSituation(obs, dir)) {
+            const guardEnemy = getGuardEnemy(obs, dir);
+            this.guardHoldFrames = Math.min(this.guardHoldFrames + 1, 180);
+
+            action.left = false;
+            action.right = false;
+
+            const enemyClose = guardEnemy && Math.abs(guardEnemy.dx) < TILE * 2.1;
+            const enemyPassed = !guardEnemy || guardEnemy.dx * dir < -TILE * 0.5;
+
+            if (enemyClose && isOnDropPlatform(obs) && hasDropSpace(obs)) {
+              this.baitState = "dropWait";
+              this.baitFrames = 48;
+              this.baitCooldown = 50;
+              this.lastDecision = "guard:drop-bait";
+              return makeAction(action);
+            }
+
+            if (this.guardHoldFrames > 18 && this.guardHoldFrames % 30 === 0) {
+              tryGroundJump("guard:probe-jump");
+            } else {
+              this.lastDecision = "guard:wait";
+            }
+
+            if (enemyPassed) {
+              this.guardHoldFrames = 0;
+              action.left = dir < 0;
+              action.right = dir > 0;
+              tryGroundJump("guard:resume-jump");
+              this.lastDecision = "guard:resume";
+            }
+
+            return makeAction(action);
+          }
+          this.guardHoldFrames = 0;
 
           const closeEnemyAhead = getClosestEnemyAhead(obs, dir, 6);
           if (this.baitState === "none" && this.baitCooldown <= 0 && isOnDropPlatform(obs) && hasDropSpace(obs) && isEnemyApproaching(closeEnemyAhead, dir)) {

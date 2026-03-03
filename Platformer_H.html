@@ -133,7 +133,7 @@
         "#!..#-----#......#......@.......#.R..............@.......@....#####",
         "#!..#.....#.............@.......#######.......@###--#####.........#",
         "#!..#-----#...@@@@......@.....................@!..........#..#....#",
-        "#!..#.....#.......S.....@..S............!@R...@!.!.@.....!#..#....#",
+        "#!..#.....#.......S.....@..S.............!@R..@!.!.@.....!#..#....#",
         "#!..#-----#.....@###@...#######################!...@.......##.!..!#",
         "#.......................!...!...!..!!..........R...@.R........!..!#",
         "###############################################################G###",
@@ -276,18 +276,6 @@
       function hasLowCeiling(obs) {
         return isSolidCode(getObsTile(obs, 0, -1)) || isSolidCode(getObsTile(obs, 1, -1)) || isSolidCode(getObsTile(obs, -1, -1));
       }
-      function hasForwardLowCeiling(obs, dir = 1) {
-        return isSolidCode(getObsTile(obs, dir, -1)) || isSolidCode(getObsTile(obs, dir * 2, -1));
-      }
-      function deathDistanceAhead(obs, dir = 1, maxTiles = 4) {
-        for (let step = 1; step <= maxTiles; step++) {
-          const footTile = getObsTile(obs, dir * step, 1);
-          const bodyTile = getObsTile(obs, dir * step, 0);
-          if (footTile === 4 || bodyTile === 4) return step;
-          if (isSolidCode(footTile) && step > 1) break;
-        }
-        return null;
-      }
 
       class HumanAgent {
         reset() {}
@@ -371,20 +359,9 @@
             if (obs.player.grounded) action.jump = true;
           }
 
-          const lowTunnelAhead = hasLowCeiling(obs) || hasForwardLowCeiling(obs, dir);
-          const deathAheadTiles = deathDistanceAhead(obs, dir, 4);
-
           if (isEnemyThreat(obs, TILE * 2.2) && obs.player.grounded) action.jump = true;
-
-          if (obs.player.grounded && deathAheadTiles !== null) {
-            const mustJumpNow = deathAheadTiles <= 1;
-            const goodJumpWindow = !lowTunnelAhead && deathAheadTiles <= 2;
-            if (mustJumpNow || goodJumpWindow) action.jump = true;
-          }
-
-          if ((isGapAhead(obs, dir) || isWallAhead(obs, dir)) && obs.player.grounded) {
-            if (!lowTunnelAhead || (deathAheadTiles !== null && deathAheadTiles <= 1)) action.jump = true;
-          }
+          if (isDeathAhead(obs, dir) && obs.player.grounded) action.jump = true;
+          if ((isGapAhead(obs, dir) || isWallAhead(obs, dir)) && obs.player.grounded) action.jump = true;
 
           if (shouldAvoidEnemyLanding(obs, dir) && obs.player.grounded) {
             action.jump = true;

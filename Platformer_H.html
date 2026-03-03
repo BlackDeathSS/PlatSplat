@@ -106,6 +106,7 @@
           <select id="agentSelect" style="background:#1a1a2b; color:var(--fg); border:1px solid rgba(255,255,255,0.2); border-radius:8px; padding:6px 8px;">
             <option value="human">Human</option>
             <option value="rule">RuleBased</option>
+            <option value="planner">Planner (A*)</option>
           </select>
         </label>
         <button id="btnFullscreen">⛶ Fullscreen</button>
@@ -391,9 +392,267 @@
         onEpisodeEnd() {}
       }
 
+      class AStarPlannerAgent {
+        constructor() {
+          this.planTiles = [];
+          this.planCursor = 0;
+          this.lastReplanFrame = -9999;
+          this.stuckFrames = 0;
+          this.lastPos = null;
+          this.frameCount = 0;
+          this.maxJumpHeightTiles = 4;
+          this.maxJumpDistanceTiles = 5;
+          this.maxDropTiles = 5;
+          this.fallbackAgent = new RuleBasedAgent();
+        }
+
+        reset(obs) {
+          this.planTiles = [];
+          this.planCursor = 0;
+          this.lastReplanFrame = -9999;
+          this.stuckFrames = 0;
+          this.lastPos = obs ? { x: obs.player.x, y: obs.player.y } : null;
+          this.frameCount = 0;
+          this.fallbackAgent.reset(obs);
+          this.replan(obs);
+        }
+
+        isSolidGeometry(ch) {
+          return ch === "#" || ch === "@" || ch === "-";
+        }
+
+        isBlockedGeometry(ch) {
+          return ch === "#" || ch === "@";
+        }
+
+        isHazard(ch) {
+          return ch === "!";
+        }
+
+        canOccupyTile(tx, ty) {
+          if (tx < 0 || tx >= cols || ty < 0 || ty >= rows) return false;
+          const feet = tileAt(tx, ty);
+          const head = tileAt(tx, ty - 1);
+          return !this.isBlockedGeometry(feet) && !this.isBlockedGeometry(head) && !this.isHazard(feet) && !this.isHazard(head);
+        }
+
+        hasSupport(tx, ty) {
+          if (ty + 1 >= rows) return false;
+          const below = tileAt(tx, ty + 1);
+          return this.isSolidGeometry(below);
+        }
+
+        nodeKey(tx, ty) {
+          return `${tx},${ty}`;
+        }
+
+        heuristic(ax, ay, bx, by) {
+          return Math.abs(ax - bx) + Math.abs(ay - by) * 1.35;
+        }
+
+        getNeighbors(node) {
+          const neighbors = [];
+
+          for (const dir of [-1, 1]) {
+            const ntx = node.x + dir;
+            const nty = node.y;
+            if (this.canOccupyTile(ntx, nty) && this.hasSupport(ntx, nty)) {
+              neighbors.push({ x: ntx, y: nty, cost: 1.0 });
+            }
+          }
+
+          for (let dx = -this.maxJumpDistanceTiles; dx <= this.maxJumpDistanceTiles; dx++) {
+            if (dx === 0) continue;
+            for (let dy = 1; dy <= this.maxJumpHeightTiles; dy++) {
+              const ntx = node.x + dx;
+              const nty = node.y - dy;
+              if (!this.canOccupyTile(ntx, nty) || !this.hasSupport(ntx, nty)) continue;
+
+              const xStep = dx > 0 ? 1 : -1;
+              let clearArc = true;
+              for (let x = node.x; x !== ntx; x += xStep) {
+                if (!this.canOccupyTile(x, node.y - Math.min(dy, 2))) {
+                  clearArc = false;
+                  break;
+                }
+              }
+              if (clearArc) neighbors.push({ x: ntx, y: nty, cost: 1.7 + Math.abs(dx) * 0.25 + dy * 0.2 });
+            }
+          }
+
+          for (let dir of [-1, 1]) {
+            const ntx = node.x + dir;
+            for (let drop = 1; drop <= this.maxDropTiles; drop++) {
+              const nty = node.y + drop;
+              if (!this.canOccupyTile(ntx, nty)) break;
+              if (this.hasSupport(ntx, nty)) {
+                neighbors.push({ x: ntx, y: nty, cost: 1.2 + drop * 0.3 });
+                break;
+              }
+            }
+          }
+
+          return neighbors;
+        }
+
+        findPath(start, goal) {
+          const open = [{ x: start.x, y: start.y, f: 0 }];
+          const gScore = new Map([[this.nodeKey(start.x, start.y), 0]]);
+          const cameFrom = new Map();
+          const closed = new Set();
+          const budget = 3200;
+          let explored = 0;
+
+          while (open.length > 0 && explored < budget) {
+            explored++;
+            let bestIndex = 0;
+            for (let i = 1; i < open.length; i++) {
+              if (open[i].f < open[bestIndex].f) bestIndex = i;
+            }
+            const current = open.splice(bestIndex, 1)[0];
+            const currentKey = this.nodeKey(current.x, current.y);
+            if (closed.has(currentKey)) continue;
+
+            if (Math.abs(current.x - goal.x) <= 1 && Math.abs(current.y - goal.y) <= 1) {
+              const path = [{ x: current.x, y: current.y }];
+              let k = currentKey;
+              while (cameFrom.has(k)) {
+                const prev = cameFrom.get(k);
+                path.push(prev);
+                k = this.nodeKey(prev.x, prev.y);
+              }
+              path.reverse();
+              return path;
+            }
+
+            closed.add(currentKey);
+            const currentG = gScore.get(currentKey) ?? Infinity;
+
+            for (const next of this.getNeighbors(current)) {
+              const nKey = this.nodeKey(next.x, next.y);
+              if (closed.has(nKey)) continue;
+              const candidate = currentG + next.cost;
+              if (candidate >= (gScore.get(nKey) ?? Infinity)) continue;
+
+              cameFrom.set(nKey, { x: current.x, y: current.y });
+              gScore.set(nKey, candidate);
+              const h = this.heuristic(next.x, next.y, goal.x, goal.y);
+              open.push({ x: next.x, y: next.y, f: candidate + h });
+            }
+          }
+
+          return [];
+        }
+
+        toTilePosition(obs) {
+          const cx = obs.player.x + player.w * 0.5;
+          const cy = obs.player.y + player.h * 0.5;
+          return { x: Math.floor(cx / TILE), y: Math.floor(cy / TILE) };
+        }
+
+        findGoalTile() {
+          if (!goalRect) return null;
+          return {
+            x: Math.floor((goalRect.x + goalRect.w * 0.5) / TILE),
+            y: Math.floor((goalRect.y + goalRect.h * 0.75) / TILE),
+          };
+        }
+
+        replan(obs) {
+          const start = this.toTilePosition(obs);
+          const goal = this.findGoalTile();
+          if (!goal) {
+            this.planTiles = [];
+            this.planCursor = 0;
+            return;
+          }
+          const path = this.findPath(start, goal);
+          this.planTiles = path;
+          this.planCursor = path.length > 1 ? 1 : 0;
+          this.lastReplanFrame = this.frameCount;
+        }
+
+        maybeAdvancePlan(currentTile) {
+          while (this.planCursor < this.planTiles.length) {
+            const target = this.planTiles[this.planCursor];
+            if (Math.abs(target.x - currentTile.x) <= 0 && Math.abs(target.y - currentTile.y) <= 0) {
+              this.planCursor++;
+            } else {
+              break;
+            }
+          }
+        }
+
+        shouldUseFallback(obs) {
+          if (obs.enemies.length > 0 || obs.bullets.length > 0) return true;
+          if (this.planTiles.length === 0 || this.planCursor >= this.planTiles.length) return true;
+          return false;
+        }
+
+        act(obs) {
+          this.frameCount++;
+
+          if (this.lastPos) {
+            const moved = Math.hypot(obs.player.x - this.lastPos.x, obs.player.y - this.lastPos.y);
+            this.stuckFrames = moved < 0.8 ? this.stuckFrames + 1 : 0;
+          }
+          this.lastPos = { x: obs.player.x, y: obs.player.y };
+
+          const currentTile = this.toTilePosition(obs);
+          this.maybeAdvancePlan(currentTile);
+
+          const needsReplan = this.planTiles.length === 0
+            || this.planCursor >= this.planTiles.length
+            || this.stuckFrames > 40
+            || this.frameCount - this.lastReplanFrame > 150;
+
+          if (needsReplan) {
+            this.stuckFrames = 0;
+            this.replan(obs);
+          }
+
+          if (this.shouldUseFallback(obs)) {
+            return this.fallbackAgent.act(obs);
+          }
+
+          const target = this.planTiles[this.planCursor];
+          const targetX = target.x * TILE + TILE * 0.5;
+          const targetY = target.y * TILE + TILE * 0.5;
+          const dx = targetX - (obs.player.x + player.w * 0.5);
+          const dy = targetY - (obs.player.y + player.h * 0.5);
+          const action = { left: false, right: false, jump: false, down: false };
+
+          if (Math.abs(dx) > 4) {
+            action.left = dx < 0;
+            action.right = dx > 0;
+          }
+
+          if (obs.player.grounded) {
+            if (dy < -TILE * 0.35) action.jump = true;
+            if (isGapAhead(obs, action.right ? 1 : -1) && Math.abs(dx) > TILE * 0.6) action.jump = true;
+            if (isWallAhead(obs, action.right ? 1 : -1)) action.jump = true;
+          }
+
+          if (!obs.player.grounded && obs.player.wallClingDir !== 0 && dy < -8) {
+            action.jump = true;
+            action.left = obs.player.wallClingDir > 0;
+            action.right = obs.player.wallClingDir < 0;
+          }
+
+          return makeAction(action);
+        }
+
+        onStep() {}
+        onEpisodeEnd() {}
+      }
+
       class AgentManager {
         constructor() {
-          this.agents = { human: new HumanAgent(), rule: new RuleBasedAgent() };
+          this.agents = {
+            human: new HumanAgent(),
+            rule: new RuleBasedAgent(),
+            planner: new AStarPlannerAgent(),
+          };
           this.activeKey = "human";
         }
         setActive(key) {

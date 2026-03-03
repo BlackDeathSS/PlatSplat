@@ -94,8 +94,9 @@
         <canvas id="cv" width="900" height="520"></canvas>
         <div id="winMsg" class="status-overlay" style="color: var(--goal);">LEVEL CLEARED!<br><span style="font-size:20px; color:#fff">Press 'R' to Restart</span></div>
         <div id="replayMsg" class="status-overlay" style="color: var(--replay); font-size:32px;">REPLAY MODE</div>
+        <div id="pauseMsg" class="status-overlay" style="color: var(--accent); font-size:36px;">PAUSED</div>
         <div class="tips" id="tipText">
-          Controls: <b>W A S D</b> or <b>Arrows</b> | <b>S</b>: Drop ledges | <b>Hold toward @ walls</b> to cling/walljump | <b>!</b> are death blocks<br>
+          Controls: <b>W A S D</b> or <b>Arrows</b> | <b>S</b>: Drop ledges | <b>P</b>: Pause | <b>Hold toward @ walls</b> to cling/walljump | <b>!</b> are death blocks<br>
         </div>
       </div>
     </div>
@@ -109,6 +110,7 @@
           </select>
         </label>
         <button id="btnFullscreen">⛶ Fullscreen</button>
+        <button id="btnPause">⏸ Pause</button>
         <button id="btnReplayLast" style="color:var(--muted); border-color:var(--muted); background:rgba(255,255,255,0.05);">▶ Replay Last Run</button>
         <button id="btnReplayBest" style="color:var(--ghost); border-color:rgba(255,200,50,0.4); background:rgba(255,200,50,0.1);">★ Replay Best Win</button>
     </div>
@@ -121,7 +123,9 @@
       const timerEl = document.getElementById("timer");
       const winMsgEl = document.getElementById("winMsg");
       const replayMsgEl = document.getElementById("replayMsg");
+      const pauseMsgEl = document.getElementById("pauseMsg");
       const agentSelectEl = document.getElementById("agentSelect");
+      const pauseBtnEl = document.getElementById("btnPause");
 
       // @ = Cling Wall, S = Shooter Enemy, R = Runner Enemy, G = Goal, ! = Death Block     
       const LEVEL = [
@@ -152,6 +156,7 @@
       let bestRun = [];
       let bestTime = Infinity;
       let isReplaying = false;
+      let isPaused = false;
       let replayFrames = [];
       let replayIndex = 0;
 
@@ -254,6 +259,24 @@
         if (obs.player.grounded) return false;
         return obs.enemies.some((e) => e.dy > -6 && e.dy < TILE * 2.5 && Math.abs(e.dx) < TILE * 1.8 && e.dx * dir > -TILE * 0.5);
       }
+      function isOnDropPlatform(obs) {
+        if (!obs.player.grounded) return false;
+        return getObsTile(obs, 0, 1) === 2 || getObsTile(obs, 0, 2) === 2;
+      }
+      function hasDropSpace(obs) {
+        return !isSolidCode(getObsTile(obs, 0, 2)) || !isSolidCode(getObsTile(obs, 0, 3));
+      }
+      function getClosestEnemyAhead(obs, dir = 1, rangeTiles = 7) {
+        const range = TILE * rangeTiles;
+        const candidates = obs.enemies
+          .filter((e) => e.dx * dir > TILE * 0.4 && e.dx * dir < range && Math.abs(e.dy) < TILE * 1.6)
+          .sort((a, b) => Math.abs(a.dx) - Math.abs(b.dx));
+        return candidates[0] || null;
+      }
+      function isEnemyApproaching(enemy, dir = 1) {
+        if (!enemy) return false;
+        return enemy.vx * dir < -5;
+      }
       function directionRiskScore(obs, dir = 1) {
         let score = 0;
         if (isDeathAhead(obs, dir)) score += 100;
@@ -294,6 +317,8 @@
           this.escapeFrames = 0;
           this.wallStuckFrames = 0;
           this.unstickFrames = 0;
+          this.baitState = "none";
+          this.baitFrames = 0;
           this.lastPos = null;
           this.lastGoalDistance = null;
           this.preferredDir = 1;
@@ -304,6 +329,8 @@
           this.escapeFrames = 0;
           this.wallStuckFrames = 0;
           this.unstickFrames = 0;
+          this.baitState = "none";
+          this.baitFrames = 0;
           this.lastPos = obs ? { x: obs.player.x, y: obs.player.y } : null;
           this.lastGoalDistance = obs ? goalDistanceScore(obs) : null;
           this.preferredDir = 1;
@@ -353,6 +380,46 @@
             action.right = obs.player.wallClingDir < 0;
             action.jump = false;
             return makeAction(action);
+          }
+
+          const closeEnemyAhead = getClosestEnemyAhead(obs, dir, 6);
+          if (this.baitState === "none" && isOnDropPlatform(obs) && hasDropSpace(obs) && isEnemyApproaching(closeEnemyAhead, dir)) {
+            this.baitState = "jumpBait";
+            this.baitFrames = 55;
+          }
+
+          if (this.baitState !== "none") {
+            this.baitFrames--;
+            const baitEnemy = getClosestEnemyAhead(obs, dir, 8);
+            const enemyNear = baitEnemy && Math.abs(baitEnemy.dx) < TILE * 1.8;
+
+            action.left = false;
+            action.right = false;
+
+            if (this.baitState === "jumpBait") {
+              if (obs.player.grounded) action.jump = true;
+              if (!obs.player.grounded || enemyNear) this.baitState = "dropWait";
+            } else if (this.baitState === "dropWait") {
+              action.down = true;
+              if (!isOnDropPlatform(obs)) this.baitState = "holdUnder";
+            } else if (this.baitState === "holdUnder") {
+              action.down = true;
+              const enemyPassed = !baitEnemy || baitEnemy.dx * dir < -TILE * 0.9;
+              if (enemyPassed && obs.player.grounded) {
+                this.baitState = "resume";
+                this.baitFrames = 20;
+              }
+            } else if (this.baitState === "resume") {
+              action.left = dir < 0;
+              action.right = dir > 0;
+              if (obs.player.grounded) action.jump = true;
+            }
+
+            if (this.baitFrames <= 0) {
+              this.baitState = "none";
+              this.baitFrames = 0;
+            }
+            if (this.baitState !== "none") return makeAction(action);
           }
 
           if (isIncomingBullet(obs, 30)) {
@@ -444,6 +511,7 @@
               keys.jump = true;
           }
           if (e.key === 's' || e.key === 'ArrowDown') keys.down = true;
+          if (e.key === 'p' || e.key === 'P') togglePause();
           if (e.key === 'r' || e.key === 'R') resetGame();
       }, { passive: false });
 
@@ -460,12 +528,20 @@
           else document.exitFullscreen();
       });
 
+      function togglePause(nextState = !isPaused) {
+        isPaused = !!nextState;
+        pauseMsgEl.style.display = isPaused ? 'block' : 'none';
+        pauseBtnEl.textContent = isPaused ? '▶ Resume' : '⏸ Pause';
+      }
+      pauseBtnEl.addEventListener("click", () => togglePause());
+
       function startReplay(runType) {
           if (runType === 'last' && lastRun.length > 0) replayFrames = lastRun;
           else if (runType === 'best' && bestRun.length > 0) replayFrames = bestRun;
           else { alert(runType === 'best' ? "You haven't won a game yet to save a best run!" : "No recent run found!"); return; }
           
           isReplaying = true; replayIndex = 0; winMsgEl.style.display = 'none';
+          togglePause(false);
           replayMsgEl.style.display = 'block'; setTimeout(() => replayMsgEl.style.display = 'none', 1500);
       }
 
@@ -725,6 +801,7 @@
           currentRun = [];
           isReplaying = false;
           replayIndex = 0;
+          togglePause(false);
           
           winMsgEl.style.display = 'none';
           replayMsgEl.style.display = 'none';
@@ -732,6 +809,7 @@
       }
 
       function updateSimulation() {
+        if (isPaused) return;
         if (isReplaying) {
             if (replayIndex < replayFrames.length) {
                 let state = replayFrames[replayIndex];

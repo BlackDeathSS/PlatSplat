@@ -57,7 +57,7 @@
     }
 
     .controls-row {
-        display: flex; gap: 12px; justify-content: center; margin-top: 5px;
+        display: flex; gap: 12px; justify-content: center; margin-top: 5px; flex-wrap: wrap;
     }
 
     button {
@@ -112,7 +112,7 @@
         <button id="btnFullscreen">⛶ Fullscreen</button>
         <button id="btnReplayLast" style="color:var(--muted); border-color:var(--muted); background:rgba(255,255,255,0.05);">▶ Replay Last Run</button>
         <button id="btnReplayBest" style="color:var(--ghost); border-color:rgba(255,200,50,0.4); background:rgba(255,200,50,0.1);">★ Replay Best Win</button>
-        <button id="btnPause">⏸ Pause</button>
+        <button id="btnPause" style="color:#ffe39d; border-color:rgba(255,227,157,0.55); background:rgba(120,90,30,0.18);">⏸ Pause</button>
         <button id="btnCopyDebug" style="color:#9fd5ff; border-color:rgba(159,213,255,0.45); background:rgba(80,120,180,0.15);">⎘ Copy Debug Data</button>
     </div>
     <div id="aiDebug" style="max-width:950px; width:100%; color:var(--muted); font-size:12px; font-family:ui-monospace, SFMono-Regular, monospace; margin-top:8px; min-height:34px;"></div>
@@ -431,6 +431,7 @@
           this.debug = { currentNode: "-", plannedActions: [], reason: "init", pathNodes: [] };
           this.budgetExceeded = false;
           this.goalFound = false;
+          this.jumpAssistFrames = 0;
         }
         reset(obs) {
           this.ruleFallback.reset(obs);
@@ -681,17 +682,27 @@
           this.lastPos = { x: obs.player.x, y: obs.player.y };
           return null;
         }
-        ruleNavigateToNode(obs, targetNode) {
+        ruleNavigateToNode(obs, targetNode, macroHint = "") {
           if (!targetNode) return this.ruleFallback.act(obs);
           const selfNode = this.nodeFromState({ x: obs.player.x, y: obs.player.y, vx: obs.player.vx, vy: obs.player.vy, onGround: obs.player.grounded, touchingWallDir: obs.player.wallClingDir || 0 });
           const dxTiles = targetNode.tileX - selfNode.tileX;
           const dyTiles = targetNode.tileY - selfNode.tileY;
-          const dir = dxTiles < 0 ? -1 : 1;
+          let dir = dxTiles < 0 ? -1 : 1;
+          if (macroHint.includes("left")) dir = -1;
+          else if (macroHint.includes("right")) dir = 1;
           const action = { left: dir < 0, right: dir > 0, jump: false, down: false };
           const unsafeJump = hasUnsafeOverheadForJump(obs, dir);
+          const macroNeedsJump = macroHint.includes("jump");
 
-          if (!unsafeJump && obs.player.grounded && (isWallAhead(obs, dir) || isGapAhead(obs, dir) || isDeathAhead(obs, dir) || dyTiles < -1)) {
+          if (macroNeedsJump && !unsafeJump && (obs.player.grounded || obs.player.wallClingDir !== 0)) this.jumpAssistFrames = 5;
+          if (this.jumpAssistFrames > 0 && !unsafeJump) {
             action.jump = true;
+            this.jumpAssistFrames--;
+          }
+
+          if (!unsafeJump && obs.player.grounded && (isWallAhead(obs, dir) || isGapAhead(obs, dir) || isDeathAhead(obs, dir) || dyTiles <= -1)) {
+            action.jump = true;
+            this.jumpAssistFrames = Math.max(this.jumpAssistFrames, 2);
           }
           if (!unsafeJump && obs.player.wallClingDir !== 0 && dyTiles < 0) action.jump = true;
           if (dyTiles > 1 && obs.player.grounded && !isGapAhead(obs, dir)) action.down = true;
@@ -735,7 +746,8 @@
             this.debug.reason = "plan_complete_fallback";
             return this.fallbackAction(obs);
           }
-          return this.ruleNavigateToNode(obs, this.expectedNode);
+          const macroHint = this.plan[0]?.macro || "";
+          return this.ruleNavigateToNode(obs, this.expectedNode, macroHint);
         }
         onStep() {}
         onEpisodeEnd() {}
@@ -1163,7 +1175,7 @@
 
             if (!player.won) {
                 timeElapsed += FIXED_DT;
-                timerEl.textContent = timeElapsed.toFixed(2) + "s";
+                timerEl.textContent = timeElapsed.toFixed(2) + (isPaused ? "s (PAUSED)" : "s");
             } else { winMsgEl.style.display = 'block'; }
 
             const obs = buildObservation();
@@ -1288,8 +1300,12 @@
             ctx.fillStyle = "rgba(0,0,0,0.35)";
             ctx.fillRect(0, 0, cv.width, cv.height);
             ctx.fillStyle = "#fff";
-            ctx.font = "bold 28px system-ui";
-            ctx.fillText("PAUSED", 24, 38);
+            ctx.font = "bold 44px system-ui";
+            ctx.textAlign = "center";
+            ctx.fillText("PAUSED", cv.width / 2, cv.height / 2);
+            ctx.font = "16px system-ui";
+            ctx.fillText("Press P or Resume button", cv.width / 2, cv.height / 2 + 28);
+            ctx.textAlign = "start";
         }
 
         if (!player.dead) {

@@ -276,6 +276,12 @@
       function hasLowCeiling(obs) {
         return isSolidCode(getObsTile(obs, 0, -1)) || isSolidCode(getObsTile(obs, 1, -1)) || isSolidCode(getObsTile(obs, -1, -1));
       }
+      function hasJumpHeadroomAhead(obs, dir = 1) {
+        const blockedNow = isSolidCode(getObsTile(obs, 0, -1)) || isSolidCode(getObsTile(obs, 0, -2));
+        const blockedForward = isSolidCode(getObsTile(obs, dir, -1)) || isSolidCode(getObsTile(obs, dir, -2));
+        const blockedTwoAhead = isSolidCode(getObsTile(obs, dir * 2, -1));
+        return !(blockedNow || blockedForward || blockedTwoAhead);
+      }
 
       class HumanAgent {
         reset() {}
@@ -359,9 +365,24 @@
             if (obs.player.grounded) action.jump = true;
           }
 
+          const wallAhead = isWallAhead(obs, dir);
+          const gapAhead = isGapAhead(obs, dir);
+          const jumpHeadroomAhead = hasJumpHeadroomAhead(obs, dir);
+          const shouldJumpWall = wallAhead && jumpHeadroomAhead;
+          const shouldJumpGap = gapAhead && jumpHeadroomAhead;
+
           if (isEnemyThreat(obs, TILE * 2.2) && obs.player.grounded) action.jump = true;
           if (isDeathAhead(obs, dir) && obs.player.grounded) action.jump = true;
-          if ((isGapAhead(obs, dir) || isWallAhead(obs, dir)) && obs.player.grounded) action.jump = true;
+          if ((shouldJumpGap || shouldJumpWall) && obs.player.grounded) action.jump = true;
+
+          if ((wallAhead || (gapAhead && !jumpHeadroomAhead)) && !jumpHeadroomAhead && obs.player.grounded) {
+            const retreatDir = chooseSaferDirection(obs, -dir);
+            this.escapeFrames = Math.max(this.escapeFrames, 30);
+            this.preferredDir = retreatDir;
+            action.left = retreatDir < 0;
+            action.right = retreatDir > 0;
+            action.jump = false;
+          }
 
           if (shouldAvoidEnemyLanding(obs, dir) && obs.player.grounded) {
             action.jump = true;

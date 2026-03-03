@@ -724,7 +724,7 @@
       class PPOAgent {
         constructor(config = {}) {
           this.actionCount = DISCRETE_ACTIONS.length;
-          this.featureCount = extractPolicyFeatures(buildObservation()).length;
+          this.featureCount = null;
           this.rolloutSize = config.rolloutSize || 256;
           this.gamma = config.gamma || 0.992;
           this.gaeLambda = config.gaeLambda || 0.95;
@@ -736,11 +736,19 @@
           this.explore = config.explore ?? true;
           this.rollout = [];
           this.lastTransition = null;
+          this.policy = null;
+          this.valueWeights = null;
+        }
+
+        initializeModel(obs) {
+          if (this.policy && this.valueWeights) return;
+          this.featureCount = extractPolicyFeatures(obs).length;
           this.policy = Array.from({ length: this.actionCount }, () => Array.from({ length: this.featureCount }, () => (Math.random() - 0.5) * 0.02));
           this.valueWeights = Array.from({ length: this.featureCount }, () => (Math.random() - 0.5) * 0.02);
         }
 
-        reset() {
+        reset(obs) {
+          if (obs) this.initializeModel(obs);
           this.lastTransition = null;
         }
 
@@ -748,6 +756,7 @@
         value(features) { return dot(this.valueWeights, features); }
 
         act(obs) {
+          this.initializeModel(obs);
           const features = extractPolicyFeatures(obs);
           const logits = this.computeLogits(features);
           const probs = softmax(logits);
@@ -787,6 +796,7 @@
         }
 
         trainOnRollout() {
+          if (!this.policy || !this.valueWeights) return;
           if (this.rollout.length < 32) return;
           const batch = this.rollout.splice(0, this.rollout.length);
           const { adv, returns } = this.discountedAdvantages(batch);

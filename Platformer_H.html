@@ -106,12 +106,16 @@
           <select id="agentSelect" style="background:#1a1a2b; color:var(--fg); border:1px solid rgba(255,255,255,0.2); border-radius:8px; padding:6px 8px;">
             <option value="human">Human</option>
             <option value="rule">RuleBased</option>
+            <option value="planner">HybridPlanner</option>
           </select>
         </label>
         <button id="btnFullscreen">⛶ Fullscreen</button>
         <button id="btnReplayLast" style="color:var(--muted); border-color:var(--muted); background:rgba(255,255,255,0.05);">▶ Replay Last Run</button>
         <button id="btnReplayBest" style="color:var(--ghost); border-color:rgba(255,200,50,0.4); background:rgba(255,200,50,0.1);">★ Replay Best Win</button>
+        <button id="btnPause">⏸ Pause</button>
+        <button id="btnCopyDebug" style="color:#9fd5ff; border-color:rgba(159,213,255,0.45); background:rgba(80,120,180,0.15);">⎘ Copy Debug Data</button>
     </div>
+    <div id="aiDebug" style="max-width:950px; width:100%; color:var(--muted); font-size:12px; font-family:ui-monospace, SFMono-Regular, monospace; margin-top:8px; min-height:34px;"></div>
   </div>
 
   <script>
@@ -122,6 +126,9 @@
       const winMsgEl = document.getElementById("winMsg");
       const replayMsgEl = document.getElementById("replayMsg");
       const agentSelectEl = document.getElementById("agentSelect");
+      const aiDebugEl = document.getElementById("aiDebug");
+      const btnPauseEl = document.getElementById("btnPause");
+      const btnCopyDebugEl = document.getElementById("btnCopyDebug");
 
       // @ = Cling Wall, S = Shooter Enemy, R = Runner Enemy, G = Goal, ! = Death Block     
       const LEVEL = [
@@ -154,6 +161,12 @@
       let isReplaying = false;
       let replayFrames = [];
       let replayIndex = 0;
+      let episodeId = 0;
+      let episodeDeaths = 0;
+      let maxProgressX = spawn.x;
+      let isPaused = false;
+      const debugSnapshots = [];
+      const MAX_DEBUG_SNAPSHOTS = 2200;
 
       const keys = { left: false, right: false, jump: false, down: false, jumpPressed: false };
       const aiControlState = { left: false, right: false, jump: false, down: false };
@@ -276,6 +289,13 @@
       function hasLowCeiling(obs) {
         return isSolidCode(getObsTile(obs, 0, -1)) || isSolidCode(getObsTile(obs, 1, -1)) || isSolidCode(getObsTile(obs, -1, -1));
       }
+      function hasUnsafeOverheadForJump(obs, dir = 1) {
+        const deathOverhead = getObsTile(obs, 0, -1) === 4 || getObsTile(obs, dir, -1) === 4 || getObsTile(obs, 0, -2) === 4 || getObsTile(obs, dir, -2) === 4;
+        const enemyOverhead = obs.enemies.some((e) => e.dy < -4 && e.dy > -TILE * 2.4 && Math.abs(e.dx) < TILE * 1.3);
+        const overheadBlocker = isSolidCode(getObsTile(obs, 0, -1)) || isSolidCode(getObsTile(obs, dir, -1));
+        const oneWayAbove = getObsTile(obs, 0, -1) === 2 || getObsTile(obs, dir, -1) === 2;
+        return deathOverhead || enemyOverhead || (overheadBlocker && oneWayAbove);
+      }
       function goalDistanceScore(obs) {
         return Math.hypot(obs.goal.dx, obs.goal.dy * 0.65);
       }
@@ -310,6 +330,7 @@
         }
         act(obs) {
           const action = { left: false, right: false, jump: false, down: false };
+          const unsafeJump = hasUnsafeOverheadForJump(obs, obs.goal.dx < -10 ? -1 : 1);
 
           if (this.lastPos) {
             const moved = Math.hypot(obs.player.x - this.lastPos.x, obs.player.y - this.lastPos.y);
@@ -364,15 +385,15 @@
 
             action.left = safeRetreatDir < 0;
             action.right = safeRetreatDir > 0;
-            if (obs.player.grounded) action.jump = true;
+            if (obs.player.grounded && !unsafeJump) action.jump = true;
           }
 
-          if (isEnemyThreat(obs, TILE * 2.2) && obs.player.grounded) action.jump = true;
-          if (isDeathAhead(obs, dir) && obs.player.grounded) action.jump = true;
-          if ((isGapAhead(obs, dir) || isWallAhead(obs, dir)) && obs.player.grounded) action.jump = true;
+          if (isEnemyThreat(obs, TILE * 2.2) && obs.player.grounded && !unsafeJump) action.jump = true;
+          if (isDeathAhead(obs, dir) && obs.player.grounded && !unsafeJump) action.jump = true;
+          if ((isGapAhead(obs, dir) || isWallAhead(obs, dir)) && obs.player.grounded && !unsafeJump) action.jump = true;
 
           if (shouldAvoidEnemyLanding(obs, dir) && obs.player.grounded) {
-            action.jump = true;
+            action.jump = !unsafeJump;
             action.left = dir > 0;
             action.right = dir < 0;
           }
@@ -387,7 +408,7 @@
             action.left = pushAwayFromWall ? obs.player.wallClingDir < 0 : obs.player.wallClingDir > 0;
             action.right = pushAwayFromWall ? obs.player.wallClingDir > 0 : obs.player.wallClingDir < 0;
             if (this.wallJumpCooldown <= 0 && pushAwayFromWall) {
-              action.jump = true;
+              action.jump = !unsafeJump;
               this.wallJumpCooldown = 6;
             }
           }
@@ -399,11 +420,333 @@
         onEpisodeEnd() {}
       }
 
+      class AStarPlannerAgent {
+        constructor() {
+          this.ruleFallback = new RuleBasedAgent();
+          this.plan = [];
+          this.expectedNode = null;
+          this.lastPos = null;
+          this.stuckFrames = 0;
+          this.lastReplanReason = "init";
+          this.debug = { currentNode: "-", plannedActions: [], reason: "init", pathNodes: [] };
+          this.budgetExceeded = false;
+          this.goalFound = false;
+        }
+        reset(obs) {
+          this.ruleFallback.reset(obs);
+          this.plan = [];
+          this.expectedNode = null;
+          this.lastPos = obs ? { x: obs.player.x, y: obs.player.y } : null;
+          this.stuckFrames = 0;
+          this.lastReplanReason = "reset";
+          this.debug = { currentNode: "-", plannedActions: [], reason: "reset", pathNodes: [] };
+          this.budgetExceeded = false;
+          this.goalFound = false;
+        }
+        vxBucket(vx) { return Math.max(-2, Math.min(2, Math.round(vx / 90))); }
+        nodeFromState(state) {
+          const tileX = Math.floor((state.x + 9) / TILE);
+          const tileY = Math.floor((state.y + 11) / TILE);
+          return { tileX, tileY, vxBucket: this.vxBucket(state.vx), grounded: !!state.onGround, wallSide: state.touchingWallDir || 0 };
+        }
+        nodeKey(node) {
+          return `${node.tileX},${node.tileY},${node.vxBucket},${node.grounded ? 1 : 0},${node.wallSide}`;
+        }
+        tileKey(node) { return `${node.tileX},${node.tileY}`; }
+        pruneLoopingPath(path) {
+          const pruned = [];
+          const seen = new Map();
+          for (const step of path) {
+            const key = this.tileKey(step.expectedNode);
+            if (pruned.length > 0 && this.tileKey(pruned[pruned.length - 1].expectedNode) === key) continue;
+            if (seen.has(key)) {
+              pruned.splice(seen.get(key) + 1);
+              seen.clear();
+              pruned.forEach((s, idx) => seen.set(this.tileKey(s.expectedNode), idx));
+              continue;
+            }
+            pruned.push(step);
+            seen.set(key, pruned.length - 1);
+          }
+          return pruned;
+        }
+        hScore(state) {
+          if (!goalRect) return 0;
+          const dx = Math.abs(goalRect.x - state.x) / TILE;
+          const dy = Math.abs(goalRect.y - state.y) / TILE;
+          return dx + dy * 1.35;
+        }
+        macroLibrary() {
+          return [
+            { name: "run_left", frames: 8, controls: () => ({ left: true }) },
+            { name: "run_right", frames: 8, controls: () => ({ right: true }) },
+            { name: "short_jump_left", frames: 10, controls: (f) => ({ left: true, jump: f < 3 }) },
+            { name: "short_jump_right", frames: 10, controls: (f) => ({ right: true, jump: f < 3 }) },
+            { name: "wall_jump", frames: 10, controls: (f, st) => {
+              const awayLeft = st.touchingWallDir > 0;
+              return { left: awayLeft, right: !awayLeft, jump: f < 2 };
+            }},
+          ];
+        }
+        predictedHazards(obs, horizonFrames = 120) {
+          const hazards = [];
+          for (const b of obs.bullets) {
+            const absX = obs.player.x + b.dx;
+            const absY = obs.player.y + b.dy;
+            for (let t = 0; t <= horizonFrames; t += 2) hazards.push({ x: absX + b.vx * FIXED_DT * t, y: absY, w: 8, h: 8, t });
+          }
+          for (const e of obs.enemies) {
+            const absX = obs.player.x + e.dx;
+            const absY = obs.player.y + e.dy;
+            for (let t = 0; t <= horizonFrames; t += 3) hazards.push({ x: absX + e.vx * FIXED_DT * t, y: absY + e.vy * FIXED_DT * t, w: 18, h: 22, t });
+          }
+          return hazards;
+        }
+        overlapRect(a, b) {
+          return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+        }
+        simulateStateStep(state, action) {
+          const st = { ...state };
+          let ax = 0;
+          if (action.right) ax += 1;
+          if (action.left) ax -= 1;
+          const wasGrounded = st.onGround;
+          st.onGround = false;
+
+          st.vx += ax * MOVE_ACCEL * FIXED_DT;
+          st.vx = Math.max(-MAX_VX, Math.min(MAX_VX, st.vx));
+          if (ax === 0 || (ax < 0 && st.vx > 0) || (ax > 0 && st.vx < 0)) st.vx *= Math.exp(-FRICTION * FIXED_DT);
+          if (action.jump && wasGrounded) st.vy = JUMP_VY;
+          st.vy += GRAV * FIXED_DT;
+
+          if (st.touchingWallDir !== 0 && !wasGrounded) {
+            const holdWall = (st.touchingWallDir === 1 && action.right) || (st.touchingWallDir === -1 && action.left);
+            if (holdWall) {
+              if (st.vy > 60) st.vy = 60;
+              if (action.jump) {
+                st.vy = JUMP_VY * 0.9;
+                st.vx = -st.touchingWallDir * MAX_VX * 1.5;
+              }
+            }
+          }
+
+          st.x += st.vx * FIXED_DT;
+          this.resolveSimCollision(st, "x", action.down);
+          st.y += st.vy * FIXED_DT;
+          this.resolveSimCollision(st, "y", action.down);
+          st.dead = st.dead || st.y > WORLD_H + 120 || tileAt(Math.floor((st.x + 9) / TILE), Math.floor((st.y + 11) / TILE)) === "!";
+          st.won = goalRect ? this.overlapRect({ x: st.x, y: st.y, w: 18, h: 22 }, goalRect) : false;
+          return st;
+        }
+        resolveSimCollision(st, axis, downHeld) {
+          const box = { x: st.x, y: st.y, w: 18, h: 22 };
+          const left = Math.floor(box.x / TILE), right = Math.floor((box.x + box.w) / TILE);
+          const top = Math.floor(box.y / TILE), bottom = Math.floor((box.y + box.h) / TILE);
+          if (axis === "x") st.touchingWallDir = 0;
+          for (let ty = top - 1; ty <= bottom + 1; ty++) {
+            for (let tx = left - 1; tx <= right + 1; tx++) {
+              const tile = tileAt(tx, ty);
+              if (tile === "!") {
+                const tr = { x: tx * TILE, y: ty * TILE, w: TILE, h: TILE };
+                if (this.overlapRect(box, tr)) st.dead = true;
+              }
+              if (!isSolid(tile)) continue;
+              const tr = { x: tx * TILE, y: ty * TILE, w: TILE, h: TILE };
+              if (!this.overlapRect(box, tr)) continue;
+              if (tile === "-") {
+                if (axis === "x" || st.vy <= 0 || downHeld) continue;
+                const prevBottom = (st.y - st.vy * FIXED_DT) + box.h;
+                if (prevBottom > tr.y + 0.1) continue;
+              }
+              const penL = (box.x + box.w) - tr.x, penR = (tr.x + tr.w) - box.x;
+              const penT = (box.y + box.h) - tr.y, penB = (tr.y + tr.h) - box.y;
+              if (axis === "x") {
+                if (tile === "@") {
+                  if (st.vx > 0) st.touchingWallDir = 1;
+                  if (st.vx < 0) st.touchingWallDir = -1;
+                }
+                if (st.vx > 0) { st.x -= penL; st.vx = 0; }
+                else if (st.vx < 0) { st.x += penR; st.vx = 0; }
+              } else {
+                if (st.vy > 0) { st.y -= penT; st.vy = 0; st.onGround = true; }
+                else if (st.vy < 0 && tile !== "-") { st.y += penB; st.vy = 0; }
+              }
+              box.x = st.x; box.y = st.y;
+            }
+          }
+        }
+        simulateMacro(startState, macro, hazards) {
+          let st = { ...startState, dead: false, won: false };
+          let hazardPenalty = 0;
+          for (let f = 0; f < macro.frames; f++) {
+            const action = makeAction(macro.controls(f, st));
+            st = this.simulateStateStep(st, action);
+            if (st.dead) return { blocked: true };
+            const box = { x: st.x, y: st.y, w: 18, h: 22 };
+            for (const hz of hazards) {
+              if (Math.abs(hz.t - f) > 2) continue;
+              if (this.overlapRect(box, hz)) {
+                hazardPenalty += 50;
+                if (hz.w >= 8) return { blocked: true };
+              }
+            }
+          }
+          return { endState: st, gCost: macro.frames + hazardPenalty, blocked: false };
+        }
+        planPath(obs, reason = "periodic") {
+          const startState = {
+            x: obs.player.x, y: obs.player.y, vx: obs.player.vx, vy: obs.player.vy,
+            onGround: obs.player.grounded, touchingWallDir: obs.player.wallClingDir || 0,
+          };
+          const hazards = this.predictedHazards(obs, 140);
+          const startNode = this.nodeFromState(startState);
+          const startKey = this.nodeKey(startNode);
+          const open = [{ key: startKey, state: startState, node: startNode, g: 0, f: this.hScore(startState), parent: null, macro: null }];
+          const closed = new Set();
+          const best = new Map([[startKey, 0]]);
+          const macros = this.macroLibrary();
+          const maxExpand = 1300;
+          let expanded = 0;
+          let goalCandidate = null;
+          let bestHeuristicCandidate = open[0];
+          this.budgetExceeded = false;
+          this.goalFound = false;
+
+          while (open.length > 0 && expanded < maxExpand) {
+            open.sort((a, b) => a.f - b.f);
+            const cur = open.shift();
+            if (!cur || closed.has(cur.key)) continue;
+            closed.add(cur.key);
+            expanded++;
+            if (!bestHeuristicCandidate || this.hScore(cur.state) < this.hScore(bestHeuristicCandidate.state)) bestHeuristicCandidate = cur;
+            if (cur.state.won || (goalRect && cur.state.x + 18 >= goalRect.x - 8 && cur.state.y + 22 >= goalRect.y - TILE)) {
+              goalCandidate = cur;
+              this.goalFound = true;
+              break;
+            }
+            for (const macro of macros) {
+              if (macro.name === "wall_jump" && cur.state.touchingWallDir === 0) continue;
+              const edge = this.simulateMacro(cur.state, macro, hazards);
+              if (edge.blocked || !edge.endState) continue;
+              const node = this.nodeFromState(edge.endState);
+              const key = this.nodeKey(node);
+              if (closed.has(key)) continue;
+              const movedAway = this.hScore(edge.endState) > this.hScore(cur.state) + 0.15;
+              const g = cur.g + edge.gCost + (movedAway ? 3 : 0);
+              if (best.has(key) && best.get(key) <= g) continue;
+              best.set(key, g);
+              const f = g + this.hScore(edge.endState);
+              open.push({ key, state: edge.endState, node, g, f, parent: cur, macro: macro.name });
+            }
+          }
+
+          if (expanded >= maxExpand) this.budgetExceeded = true;
+          if (!goalCandidate) goalCandidate = bestHeuristicCandidate || (open.length > 0 ? open.sort((a, b) => a.f - b.f)[0] : null);
+          if (!goalCandidate) {
+            this.plan = [];
+            this.expectedNode = null;
+            this.debug.pathNodes = [];
+            this.lastReplanReason = `${reason}:no_path`;
+            return;
+          }
+          const path = [];
+          let cur = goalCandidate;
+          while (cur && cur.parent) {
+            path.push({ macro: cur.macro, expectedNode: cur.node });
+            cur = cur.parent;
+          }
+          path.reverse();
+          this.plan = this.pruneLoopingPath(path);
+          this.expectedNode = this.plan.length > 0 ? this.plan[0].expectedNode : null;
+          this.debug.pathNodes = [startNode, ...this.plan.map((p) => p.expectedNode)];
+          if (!this.goalFound) this.lastReplanReason = `${reason}:partial_path`;
+          else this.lastReplanReason = this.budgetExceeded ? `${reason}:budget` : reason;
+        }
+        shouldReplan(obs) {
+          if (this.plan.length === 0) return "plan_empty";
+          const node = this.nodeFromState({ x: obs.player.x, y: obs.player.y, vx: obs.player.vx, vy: obs.player.vy, onGround: obs.player.grounded, touchingWallDir: obs.player.wallClingDir || 0 });
+          this.debug.currentNode = this.nodeKey(node);
+          if (this.expectedNode) {
+            const diverged = Math.abs(node.tileX - this.expectedNode.tileX) > 1 || Math.abs(node.tileY - this.expectedNode.tileY) > 1;
+            if (diverged) return "state_diverged";
+          }
+          const imminentHazard = obs.bullets.some((b) => Math.abs(b.dx) < TILE * 2.2 && Math.abs(b.dy) < TILE * 1.3)
+            || obs.enemies.some((e) => Math.abs(e.dx) < TILE * 1.5 && Math.abs(e.dy) < TILE * 1.2);
+          if (imminentHazard) return "hazard_intersection";
+          if (this.lastPos) {
+            const moved = Math.hypot(obs.player.x - this.lastPos.x, obs.player.y - this.lastPos.y);
+            this.stuckFrames = moved < 0.8 ? this.stuckFrames + 1 : 0;
+            if (this.stuckFrames > 45) return "stuck_timeout";
+          }
+          this.lastPos = { x: obs.player.x, y: obs.player.y };
+          return null;
+        }
+        ruleNavigateToNode(obs, targetNode) {
+          if (!targetNode) return this.ruleFallback.act(obs);
+          const selfNode = this.nodeFromState({ x: obs.player.x, y: obs.player.y, vx: obs.player.vx, vy: obs.player.vy, onGround: obs.player.grounded, touchingWallDir: obs.player.wallClingDir || 0 });
+          const dxTiles = targetNode.tileX - selfNode.tileX;
+          const dyTiles = targetNode.tileY - selfNode.tileY;
+          const dir = dxTiles < 0 ? -1 : 1;
+          const action = { left: dir < 0, right: dir > 0, jump: false, down: false };
+          const unsafeJump = hasUnsafeOverheadForJump(obs, dir);
+
+          if (!unsafeJump && obs.player.grounded && (isWallAhead(obs, dir) || isGapAhead(obs, dir) || isDeathAhead(obs, dir) || dyTiles < -1)) {
+            action.jump = true;
+          }
+          if (!unsafeJump && obs.player.wallClingDir !== 0 && dyTiles < 0) action.jump = true;
+          if (dyTiles > 1 && obs.player.grounded && !isGapAhead(obs, dir)) action.down = true;
+
+          if (shouldEvadeMidairEnemy(obs, dir)) {
+            action.left = dir > 0;
+            action.right = dir < 0;
+          }
+          if (isIncomingBullet(obs, 18) && obs.player.grounded && !unsafeJump) action.jump = true;
+          return makeAction(action);
+        }
+        fallbackAction(obs) {
+          if (isIncomingBullet(obs, 20) || isEnemyThreat(obs, TILE * 1.6)) {
+            const evadeDir = obs.goal.dx > 0 ? -1 : 1;
+            return makeAction({ jump: obs.player.grounded && !hasUnsafeOverheadForJump(obs, evadeDir), left: evadeDir < 0, right: evadeDir > 0 });
+          }
+          return this.ruleFallback.act(obs);
+        }
+        act(obs) {
+          const replanReason = this.shouldReplan(obs);
+          if (replanReason) this.planPath(obs, replanReason);
+
+          if (this.budgetExceeded && this.plan.length === 0) {
+            this.debug.reason = "budget_exceeded_fallback";
+            return this.fallbackAction(obs);
+          }
+
+          const currentNode = this.nodeFromState({ x: obs.player.x, y: obs.player.y, vx: obs.player.vx, vy: obs.player.vy, onGround: obs.player.grounded, touchingWallDir: obs.player.wallClingDir || 0 });
+          while (this.plan.length > 0) {
+            const target = this.plan[0].expectedNode;
+            const reached = Math.abs(currentNode.tileX - target.tileX) <= 1 && Math.abs(currentNode.tileY - target.tileY) <= 1;
+            if (!reached) break;
+            this.plan.shift();
+          }
+          this.expectedNode = this.plan.length > 0 ? this.plan[0].expectedNode : null;
+          this.debug.plannedActions = this.plan.slice(0, 4).map((p) => p.macro);
+          this.debug.pathNodes = [currentNode, ...this.plan.slice(0, 18).map((p) => p.expectedNode)];
+          this.debug.reason = this.lastReplanReason;
+
+          if (!this.expectedNode) {
+            this.debug.reason = "plan_complete_fallback";
+            return this.fallbackAction(obs);
+          }
+          return this.ruleNavigateToNode(obs, this.expectedNode);
+        }
+        onStep() {}
+        onEpisodeEnd() {}
+      }
+
       class AgentManager {
         constructor() {
           this.agents = {
             human: new HumanAgent(),
             rule: new RuleBasedAgent(),
+            planner: new AStarPlannerAgent(),
           };
           this.activeKey = "human";
         }
@@ -414,9 +757,22 @@
         getAction(obs = buildObservation()) {
           return this.agents[this.activeKey].act(obs);
         }
+        onStep(transition) {
+          const agent = this.agents[this.activeKey];
+          if (agent && agent.onStep) agent.onStep(transition);
+          const debug = agent && agent.debug ? agent.debug : null;
+          aiDebugEl.textContent = debug
+            ? `node=${debug.currentNode || "-"} | plan=${(debug.plannedActions || []).join(" > ") || "-"} | nodes=${(debug.pathNodes || []).length} | replan=${debug.reason || "-"}`
+            : `agent=${this.activeKey}`;
+        }
+        onEpisodeEnd(summary) {
+          const agent = this.agents[this.activeKey];
+          if (agent && agent.onEpisodeEnd) agent.onEpisodeEnd(summary);
+        }
       }
 
       const agentManager = new AgentManager();
+      aiDebugEl.textContent = "agent=human";
       agentSelectEl.addEventListener("change", () => {
         agentManager.setActive(agentSelectEl.value);
         resetGame();
@@ -445,6 +801,7 @@
           }
           if (e.key === 's' || e.key === 'ArrowDown') keys.down = true;
           if (e.key === 'r' || e.key === 'R') resetGame();
+          if (e.key === 'p' || e.key === 'P') setPaused(!isPaused);
       }, { passive: false });
 
       window.addEventListener('keyup', (e) => {
@@ -452,6 +809,51 @@
           if (e.key === 'd' || e.key === 'ArrowRight') keys.right = false;
           if (e.key === 'w' || e.key === 'ArrowUp' || e.code === 'Space') keys.jump = false;
           if (e.key === 's' || e.key === 'ArrowDown') keys.down = false;
+      });
+
+      function setPaused(nextPaused) {
+          isPaused = !!nextPaused;
+          btnPauseEl.textContent = isPaused ? "▶ Resume" : "⏸ Pause";
+      }
+
+      function collectDebugSnapshot(obs, action) {
+          const planner = agentManager.agents.planner;
+          const plannerDebug = planner && planner.debug ? planner.debug : null;
+          debugSnapshots.push({
+            t: Number(timeElapsed.toFixed(3)),
+            player: { x: Number(player.x.toFixed(2)), y: Number(player.y.toFixed(2)), vx: Number(player.vx.toFixed(2)), vy: Number(player.vy.toFixed(2)), grounded: !!player.onGround },
+            action,
+            agent: agentManager.activeKey,
+            planner: plannerDebug ? { node: plannerDebug.currentNode, reason: plannerDebug.reason, pathNodes: (plannerDebug.pathNodes || []).slice(0, 64) } : null,
+            obsGoal: obs ? { dx: Number(obs.goal.dx.toFixed(2)), dy: Number(obs.goal.dy.toFixed(2)) } : null,
+          });
+          if (debugSnapshots.length > MAX_DEBUG_SNAPSHOTS) debugSnapshots.shift();
+      }
+
+      function buildDebugDump() {
+          const planner = agentManager.agents.planner;
+          return {
+            levelRows: rows,
+            levelCols: cols,
+            activeAgent: agentManager.activeKey,
+            paused: isPaused,
+            timeElapsed: Number(timeElapsed.toFixed(3)),
+            episode: { id: episodeId, deaths: episodeDeaths, maxProgress: Number((maxProgressX - spawn.x).toFixed(1)) },
+            planner: planner ? { reason: planner.lastReplanReason, budgetExceeded: planner.budgetExceeded, goalFound: planner.goalFound, plannedNodes: (planner.debug.pathNodes || []) } : null,
+            snapshots: debugSnapshots,
+          };
+      }
+
+      btnPauseEl.addEventListener("click", () => setPaused(!isPaused));
+      btnCopyDebugEl.addEventListener("click", async () => {
+          const payload = JSON.stringify(buildDebugDump(), null, 2);
+          try {
+            await navigator.clipboard.writeText(payload);
+            aiDebugEl.textContent = `copied_debug_bytes=${payload.length} | ${aiDebugEl.textContent}`;
+          } catch (err) {
+            console.log("[debug_dump]", payload);
+            window.prompt("Copy debug JSON:", payload);
+          }
       });
 
       document.getElementById("btnFullscreen").addEventListener("click", () => {
@@ -717,8 +1119,22 @@
                   bestTime = timeElapsed;
                   bestRun = [...currentRun];
               }
+              const summary = {
+                episode: episodeId,
+                completion: player.won ? 1 : 0,
+                timeToGoal: Number(timeElapsed.toFixed(3)),
+                deaths: episodeDeaths + (player.dead ? 1 : 0),
+                maxProgress: Number((maxProgressX - spawn.x).toFixed(1)),
+              };
+              agentManager.onEpisodeEnd(summary);
+              console.log("[episode_metrics]", JSON.stringify(summary));
           }
 
+          episodeId++;
+          setPaused(false);
+          debugSnapshots.length = 0;
+          episodeDeaths = 0;
+          maxProgressX = spawn.x;
           player = new Player();
           parseLevel();
           timeElapsed = 0;
@@ -729,6 +1145,7 @@
           winMsgEl.style.display = 'none';
           replayMsgEl.style.display = 'none';
           timerEl.textContent = "0.00s";
+          agentManager.setActive(agentManager.activeKey);
       }
 
       function updateSimulation() {
@@ -741,16 +1158,22 @@
                 replayIndex++;
             } else { setTimeout(() => resetGame(), 500); }
         } else {
-            if (player.dead) { resetGame(); return; }
+            if (isPaused) return;
+            if (player.dead) { episodeDeaths++; resetGame(); return; }
 
             if (!player.won) {
                 timeElapsed += FIXED_DT;
                 timerEl.textContent = timeElapsed.toFixed(2) + "s";
             } else { winMsgEl.style.display = 'block'; }
 
-            applyControlAction(agentManager.getAction());
+            const obs = buildObservation();
+            const action = agentManager.getAction(obs);
+            applyControlAction(action);
 
             player.update();
+            maxProgressX = Math.max(maxProgressX, player.x);
+            collectDebugSnapshot(obs, action);
+            agentManager.onStep({ obs, action, nextObs: buildObservation() });
             currentRun.push({ x: player.x, y: player.y, dead: player.dead, won: player.won });
             
             for (let i = bullets.length - 1; i >= 0; i--) {
@@ -821,6 +1244,37 @@
             ctx.fillRect(eyeX, e.y + 4, 4, 4);
         }
 
+
+        if (!isReplaying && agentManager.activeKey === "planner") {
+            const plannerAgent = agentManager.agents.planner;
+            const pathNodes = plannerAgent && plannerAgent.debug ? (plannerAgent.debug.pathNodes || []) : [];
+            if (pathNodes.length > 0) {
+                ctx.save();
+                const reachesGoal = !!plannerAgent.goalFound;
+                ctx.strokeStyle = reachesGoal ? "rgba(100, 200, 255, 0.85)" : "rgba(255, 190, 100, 0.9)";
+                ctx.fillStyle = reachesGoal ? "rgba(100, 200, 255, 0.9)" : "rgba(255, 190, 100, 0.95)";
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                for (let i = 0; i < pathNodes.length; i++) {
+                    const n = pathNodes[i];
+                    const px = n.tileX * TILE + TILE * 0.5 - cam;
+                    const py = n.tileY * TILE + TILE * 0.5;
+                    if (i === 0) ctx.moveTo(px, py);
+                    else ctx.lineTo(px, py);
+                }
+                ctx.stroke();
+                for (let i = 0; i < pathNodes.length; i++) {
+                    const n = pathNodes[i];
+                    const px = n.tileX * TILE + TILE * 0.5 - cam;
+                    const py = n.tileY * TILE + TILE * 0.5;
+                    ctx.beginPath();
+                    ctx.arc(px, py, i === 0 ? 5 : 3, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+                ctx.restore();
+            }
+        }
+
         if (!isReplaying && bestRun.length > 0) {
             let ghostFrameIndex = Math.min(currentRun.length, bestRun.length - 1);
             let ghostState = bestRun[ghostFrameIndex];
@@ -828,6 +1282,14 @@
                 ctx.fillStyle = "rgba(255, 200, 50, 0.4)";
                 ctx.fillRect(ghostState.x - cam, ghostState.y, 18, 22);
             }
+        }
+
+        if (isPaused && !isReplaying) {
+            ctx.fillStyle = "rgba(0,0,0,0.35)";
+            ctx.fillRect(0, 0, cv.width, cv.height);
+            ctx.fillStyle = "#fff";
+            ctx.font = "bold 28px system-ui";
+            ctx.fillText("PAUSED", 24, 38);
         }
 
         if (!player.dead) {

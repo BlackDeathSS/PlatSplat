@@ -307,6 +307,11 @@
         if (!isOneWayLedgeAhead(obs, dir)) return false;
         return !!getGuardEnemy(obs, dir);
       }
+      function isAdvanceBlockedAtFrontier(obs, dir = 1) {
+        const hardBlock = isWallAhead(obs, dir) || isDeathAhead(obs, dir);
+        const oneWayBlock = isOneWayLedgeAhead(obs, dir) && isWallAhead(obs, dir);
+        return hardBlock || oneWayBlock;
+      }
       function directionRiskScore(obs, dir = 1) {
         let score = 0;
         if (isDeathAhead(obs, dir)) score += 100;
@@ -348,6 +353,7 @@
           this.escapeFrames = 0;
           this.baitCooldown = 0;
           this.guardHoldFrames = 0;
+          this.resumeBurstFrames = 0;
           this.wallStuckFrames = 0;
           this.unstickFrames = 0;
           this.committedDir = 1;
@@ -366,6 +372,7 @@
           this.escapeFrames = 0;
           this.baitCooldown = 0;
           this.guardHoldFrames = 0;
+          this.resumeBurstFrames = 0;
           this.wallStuckFrames = 0;
           this.unstickFrames = 0;
           this.committedDir = 1;
@@ -383,6 +390,7 @@
           if (this.jumpCooldown > 0) this.jumpCooldown--;
           if (this.dirCommitFrames > 0) this.dirCommitFrames--;
           if (this.baitCooldown > 0) this.baitCooldown--;
+          if (this.resumeBurstFrames > 0) this.resumeBurstFrames--;
 
           const tryGroundJump = (reason) => {
             if (obs.player.grounded && this.jumpCooldown <= 0) {
@@ -402,7 +410,13 @@
             const goalImprovement = this.lastGoalDistance == null ? 0 : this.lastGoalDistance - currentGoalDistance;
             const stagnating = moved < 1.2 || goalImprovement < 1.1;
             const guardedLedge = isGuardedLedgeSituation(obs, dir);
-            this.stagnationFrames = (stagnating && !guardedLedge) ? this.stagnationFrames + 1 : 0;
+            const frontierEnemy = getClosestEnemyAhead(obs, dir, 7);
+            const frontierBlocked = !!frontierEnemy
+              && isOneWayLedgeAhead(obs, dir)
+              && isWallAhead(obs, dir)
+              && frontierEnemy.dy > -TILE * 1.2
+              && frontierEnemy.dy < TILE * 1.0;
+            this.stagnationFrames = (stagnating && !guardedLedge && !frontierBlocked) ? this.stagnationFrames + 1 : 0;
             this.lastGoalDistance = currentGoalDistance;
           }
           this.lastPos = { x: obs.player.x, y: obs.player.y };
@@ -447,14 +461,31 @@
             return makeAction(action);
           }
 
-          if (isGuardedLedgeSituation(obs, dir)) {
-            const guardEnemy = getGuardEnemy(obs, dir);
+          if (this.resumeBurstFrames > 0) {
+            action.left = dir < 0;
+            action.right = dir > 0;
+            if (this.resumeBurstFrames === 18) tryGroundJump("frontier:resume-jump");
+            this.lastDecision = "frontier:resume-run";
+            return makeAction(action);
+          }
+
+          const frontierEnemy = getClosestEnemyAhead(obs, dir, 7) || getGuardEnemy(obs, dir);
+          const frontierBlocked = obs.player.grounded
+            && !!frontierEnemy
+            && isOneWayLedgeAhead(obs, dir)
+            && isWallAhead(obs, dir)
+            && frontierEnemy.dy > -TILE * 1.2
+            && frontierEnemy.dy < TILE * 1.0
+            && !isIncomingBullet(obs, 20);
+
+          if (frontierBlocked) {
+            const guardEnemy = frontierEnemy;
             this.guardHoldFrames = Math.min(this.guardHoldFrames + 1, 180);
 
             action.left = false;
             action.right = false;
 
-            const enemyClose = guardEnemy && Math.abs(guardEnemy.dx) < TILE * 2.1;
+            const enemyClose = guardEnemy && Math.abs(guardEnemy.dx) < TILE * 2.2;
             const enemyPassed = !guardEnemy || guardEnemy.dx * dir < -TILE * 0.5;
 
             if (enemyClose && isOnDropPlatform(obs) && hasDropSpace(obs)) {
@@ -465,18 +496,16 @@
               return makeAction(action);
             }
 
-            if (this.guardHoldFrames > 18 && this.guardHoldFrames % 30 === 0) {
-              tryGroundJump("guard:probe-jump");
+            if (this.guardHoldFrames > 16 && this.guardHoldFrames % 24 === 0) {
+              tryGroundJump("frontier:probe-jump");
             } else {
-              this.lastDecision = "guard:wait";
+              this.lastDecision = "frontier:wait";
             }
 
             if (enemyPassed) {
               this.guardHoldFrames = 0;
-              action.left = dir < 0;
-              action.right = dir > 0;
-              tryGroundJump("guard:resume-jump");
-              this.lastDecision = "guard:resume";
+              this.resumeBurstFrames = 18;
+              this.lastDecision = "frontier:resume";
             }
 
             return makeAction(action);
@@ -977,7 +1006,7 @@
 
         if (debugEnabled && agentManager.activeKey === 'rule') {
           const rule = agentManager.agents.rule;
-          debugTextEl.textContent = `t=${timeElapsed.toFixed(2)}s | bait=${rule.baitState}(${rule.baitFrames}) | dir=${rule.committedDir} lock=${rule.dirCommitFrames} | jumpCD=${rule.jumpCooldown} | ${rule.lastDecision}`;
+          debugTextEl.textContent = `t=${timeElapsed.toFixed(2)}s | bait=${rule.baitState}(${rule.baitFrames}) | hold=${rule.guardHoldFrames} resume=${rule.resumeBurstFrames} | dir=${rule.committedDir} lock=${rule.dirCommitFrames} | jumpCD=${rule.jumpCooldown} | ${rule.lastDecision}`;
         } else if (debugEnabled) {
           debugTextEl.textContent = `t=${timeElapsed.toFixed(2)}s | agent=${agentManager.activeKey}`;
         } else {

@@ -106,6 +106,7 @@
           <select id="agentSelect" style="background:#1a1a2b; color:var(--fg); border:1px solid rgba(255,255,255,0.2); border-radius:8px; padding:6px 8px;">
             <option value="human">Human</option>
             <option value="rule">RuleBased</option>
+            <option value="swarm">Swarm+Rules</option>
           </select>
         </label>
         <button id="btnFullscreen">⛶ Fullscreen</button>
@@ -399,11 +400,144 @@
         onEpisodeEnd() {}
       }
 
+      class HybridSwarmAgent {
+        constructor() {
+          this.scoutCount = 16;
+          this.exploreEpsilon = 0.2;
+          this.ucbStrength = 1.6;
+          this.reset();
+        }
+        reset(obs) {
+          this.scouts = Array.from({ length: this.scoutCount }, (_, i) => ({
+            dirBias: i % 2 === 0 ? 1 : -1,
+            jumpBias: 0.15 + ((i * 37) % 7) * 0.08,
+            wallJumpBias: 0.35 + ((i * 13) % 6) * 0.09,
+            score: 0,
+            uses: 0,
+          }));
+          this.frames = 0;
+          this.stuckFrames = 0;
+          this.turnPreference = 1;
+          this.lastObs = obs || null;
+          this.lastScoutIndex = 0;
+          this.lastAction = makeAction();
+          this.visitHeat = new Map();
+        }
+        getVisitKey(obs) {
+          const tx = Math.floor(obs.player.x / TILE);
+          const ty = Math.floor(obs.player.y / TILE);
+          return `${tx},${ty}`;
+        }
+        rememberVisit(obs) {
+          const key = this.getVisitKey(obs);
+          this.visitHeat.set(key, (this.visitHeat.get(key) || 0) + 1);
+        }
+        getScoutIndex() {
+          this.frames++;
+          if (Math.random() < this.exploreEpsilon) return Math.floor(Math.random() * this.scouts.length);
+          const logTerm = Math.log(this.frames + 2);
+          let bestIndex = 0;
+          let bestValue = -Infinity;
+          for (let i = 0; i < this.scouts.length; i++) {
+            const s = this.scouts[i];
+            const mean = s.uses > 0 ? s.score / s.uses : 0.1;
+            const ucb = mean + this.ucbStrength * Math.sqrt(logTerm / (s.uses + 1));
+            if (ucb > bestValue) {
+              bestValue = ucb;
+              bestIndex = i;
+            }
+          }
+          return bestIndex;
+        }
+        act(obs) {
+          this.rememberVisit(obs);
+          const action = { left: false, right: false, jump: false, down: false };
+          const scoutIndex = this.getScoutIndex();
+          const scout = this.scouts[scoutIndex];
+          let dir = obs.goal.dx < -10 ? -1 : 1;
+
+          const nearTowerClimb = obs.goal.dy < -TILE * 2.5;
+          const sideWall = isWallAhead(obs, dir);
+          if (nearTowerClimb && sideWall) this.turnPreference = -dir;
+          if (this.stuckFrames > 24) this.turnPreference = -this.turnPreference;
+
+          if (nearTowerClimb) dir = this.turnPreference;
+          if (Math.random() < 0.35) dir = scout.dirBias;
+          dir = chooseSaferDirection(obs, dir);
+
+          action.left = dir < 0;
+          action.right = dir > 0;
+
+          const jumpNeeded = isGapAhead(obs, dir) || isWallAhead(obs, dir) || isDeathAhead(obs, dir);
+          if (jumpNeeded || (isEnemyThreat(obs, TILE * 2.7) && obs.player.grounded)) action.jump = true;
+          if (Math.random() < scout.jumpBias && obs.player.grounded) action.jump = true;
+
+          if (shouldAvoidEnemyLanding(obs, dir) && obs.player.grounded) {
+            action.jump = true;
+            action.left = dir > 0;
+            action.right = dir < 0;
+          }
+          if (shouldEvadeMidairEnemy(obs, dir)) {
+            action.left = dir > 0;
+            action.right = dir < 0;
+          }
+
+          if (obs.player.wallClingDir !== 0) {
+            const awayDir = -obs.player.wallClingDir;
+            action.left = awayDir < 0;
+            action.right = awayDir > 0;
+            if (Math.random() < scout.wallJumpBias || shouldWallJump(obs, dir)) action.jump = true;
+          }
+          if (isIncomingBullet(obs, 24)) {
+            const evadeDir = chooseSaferDirection(obs, -dir);
+            action.left = evadeDir < 0;
+            action.right = evadeDir > 0;
+            if (obs.player.grounded) action.jump = true;
+          }
+
+          this.lastScoutIndex = scoutIndex;
+          this.lastAction = makeAction(action);
+          return this.lastAction;
+        }
+        onStep(prevObs, currentObs) {
+          if (!prevObs || !currentObs) return;
+          const scout = this.scouts[this.lastScoutIndex];
+          if (!scout) return;
+
+          const prevDist = goalDistanceScore(prevObs);
+          const currDist = goalDistanceScore(currentObs);
+          const progressReward = (prevDist - currDist) * 0.08;
+          const climbReward = currentObs.goal.dy < 0 ? (prevObs.player.y - currentObs.player.y) * 0.03 : 0;
+          const forwardReward = (currentObs.player.x - prevObs.player.x) * 0.015;
+          const stallPenalty = Math.hypot(currentObs.player.x - prevObs.player.x, currentObs.player.y - prevObs.player.y) < 0.8 ? -0.08 : 0;
+          const revisitPenalty = ((this.visitHeat.get(this.getVisitKey(currentObs)) || 1) - 1) * -0.01;
+          const deathPenalty = (prevObs.player.alive && !currentObs.player.alive) ? -0.4 : 0;
+
+          const stepScore = progressReward + climbReward + forwardReward + stallPenalty + revisitPenalty + deathPenalty;
+          scout.score += stepScore;
+          scout.uses += 1;
+
+          if (stallPenalty < 0) this.stuckFrames++;
+          else this.stuckFrames = Math.max(0, this.stuckFrames - 2);
+
+          this.lastObs = currentObs;
+        }
+        onEpisodeEnd(result) {
+          const terminalBonus = result.won ? 80 : -8;
+          const scout = this.scouts[this.lastScoutIndex];
+          if (scout) {
+            scout.score += terminalBonus;
+            scout.uses += 1;
+          }
+        }
+      }
+
       class AgentManager {
         constructor() {
           this.agents = {
             human: new HumanAgent(),
             rule: new RuleBasedAgent(),
+            swarm: new HybridSwarmAgent(),
           };
           this.activeKey = "human";
         }
@@ -413,6 +547,14 @@
         }
         getAction(obs = buildObservation()) {
           return this.agents[this.activeKey].act(obs);
+        }
+        onStep(prevObs, currentObs) {
+          const activeAgent = this.agents[this.activeKey];
+          if (activeAgent && activeAgent.onStep) activeAgent.onStep(prevObs, currentObs);
+        }
+        onEpisodeEnd(result) {
+          const activeAgent = this.agents[this.activeKey];
+          if (activeAgent && activeAgent.onEpisodeEnd) activeAgent.onEpisodeEnd(result);
         }
       }
 
@@ -711,6 +853,10 @@
       }
 
       function resetGame() {
+          const hadTerminal = player && (player.won || player.dead);
+          if (hadTerminal) {
+              agentManager.onEpisodeEnd({ won: player.won, dead: player.dead, time: timeElapsed });
+          }
           if (!isReplaying && currentRun.length > 0) {
               lastRun = [...currentRun];
               if (player.won && timeElapsed < bestTime) {
@@ -748,7 +894,8 @@
                 timerEl.textContent = timeElapsed.toFixed(2) + "s";
             } else { winMsgEl.style.display = 'block'; }
 
-            applyControlAction(agentManager.getAction());
+            const prevObs = buildObservation();
+            applyControlAction(agentManager.getAction(prevObs));
 
             player.update();
             currentRun.push({ x: player.x, y: player.y, dead: player.dead, won: player.won });
@@ -780,6 +927,9 @@
                     }
                 }
             }
+
+            const currentObs = buildObservation();
+            agentManager.onStep(prevObs, currentObs);
         }
 
         const targetCam = player.x - cv.width * 0.35;

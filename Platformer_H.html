@@ -156,6 +156,8 @@
       
       const rows = LEVEL.length, cols = LEVEL[0].length, TILE = 24, WORLD_W = cols * TILE, WORLD_H = rows * TILE;
       const GRAV = 1800, MOVE_ACCEL = 5200, MAX_VX = 260, JUMP_VY = -520, FRICTION = 10, FIXED_DT = 1 / 60;
+      const RULE_SPEED_BOOST = 1.10;
+      const RULE_JUMP_BOOST = 1.04;
 
       const spawn = { x: 2 * TILE, y: 8 * TILE };
       let goalRect = null;
@@ -868,6 +870,11 @@
         update() {
           if (this.dead || this.won) return;
 
+          const usingRuleAgent = agentManager.activeKey === 'rule';
+          const accelCap = usingRuleAgent ? MOVE_ACCEL * RULE_SPEED_BOOST : MOVE_ACCEL;
+          const maxVxCap = usingRuleAgent ? MAX_VX * RULE_SPEED_BOOST : MAX_VX;
+          const jumpV = usingRuleAgent ? JUMP_VY * RULE_JUMP_BOOST : JUMP_VY;
+
           let ax = 0;
           if (keys.right) ax += 1;
           if (keys.left) ax -= 1;
@@ -875,14 +882,14 @@
           const wasGrounded = this.onGround; 
           this.onGround = false;
 
-          this.vx += ax * MOVE_ACCEL * FIXED_DT;
-          this.vx = Math.max(-MAX_VX, Math.min(MAX_VX, this.vx));
+          this.vx += ax * accelCap * FIXED_DT;
+          this.vx = Math.max(-maxVxCap, Math.min(maxVxCap, this.vx));
           
           if (ax === 0 || (ax < 0 && this.vx > 0) || (ax > 0 && this.vx < 0)) {
              this.vx *= Math.exp(-FRICTION * FIXED_DT);
           }
 
-          if (keys.jump && wasGrounded) this.vy = JUMP_VY; 
+          if (keys.jump && wasGrounded) this.vy = jumpV; 
           this.vy += GRAV * FIXED_DT;
 
           // Wall Cling & Jump Logic
@@ -893,8 +900,8 @@
                   if (this.vy > 60) this.vy = 60; 
                   
                   if (keys.jumpPressed) {
-                      this.vy = JUMP_VY * 0.9;
-                      this.vx = -this.touchingWallDir * MAX_VX * 1.5; 
+                      this.vy = jumpV * 0.9;
+                      this.vx = -this.touchingWallDir * maxVxCap * 1.5; 
                   }
               }
           }

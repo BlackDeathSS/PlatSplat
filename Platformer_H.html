@@ -110,6 +110,7 @@
           </select>
         </label>
         <button id="btnFullscreen">⛶ Fullscreen</button>
+        <button id="btnPause">⏸ Pause</button>
         <button id="btnReplayLast" style="color:var(--muted); border-color:var(--muted); background:rgba(255,255,255,0.05);">▶ Replay Last Run</button>
         <button id="btnReplayBest" style="color:var(--ghost); border-color:rgba(255,200,50,0.4); background:rgba(255,200,50,0.1);">★ Replay Best Win</button>
     </div>
@@ -152,6 +153,7 @@
       const swarmPopulationValEl = document.getElementById("swarmPopulationVal");
       const swarmEpisodeValEl = document.getElementById("swarmEpisodeVal");
       const swarmSpeedValEl = document.getElementById("swarmSpeedVal");
+      const pauseBtnEl = document.getElementById("btnPause");
 
       // @ = Cling Wall, S = Shooter Enemy, R = Runner Enemy, G = Goal, ! = Death Block     
       const LEVEL = [
@@ -176,6 +178,7 @@
       let goalRect = null;
       let cameraX = 0;
       let timeElapsed = 0;
+      let isPaused = false;
       
       let currentRun = [];
       let lastRun = [];
@@ -465,6 +468,144 @@
           this.lastScoutIndex = 0;
           this.lastAction = makeAction();
           this.visitHeat = new Map();
+          this.population = this.scouts.map((scout, idx) => ({
+            scoutIndex: idx,
+            x: spawn.x,
+            y: spawn.y,
+            w: 18,
+            h: 22,
+            vx: 0,
+            vy: 0,
+            onGround: false,
+            touchingWallDir: 0,
+            dead: false,
+            won: false,
+            fitness: 0,
+            frames: 0,
+          }));
+          this.leadBodyIndex = 0;
+        }
+        buildObsForBody(body) {
+          const playerCenterX = body.x + body.w / 2;
+          const playerCenterY = body.y + body.h / 2;
+          const tileX = Math.floor(playerCenterX / TILE);
+          const tileY = Math.floor(playerCenterY / TILE);
+          const halfW = 7;
+          const halfH = 5;
+          const localTiles = [];
+          for (let dy = -halfH; dy <= halfH; dy++) {
+            const row = [];
+            for (let dx = -halfW; dx <= halfW; dx++) row.push(tileCode(tileAt(tileX + dx, tileY + dy)));
+            localTiles.push(row);
+          }
+          return {
+            player: {
+              x: body.x, y: body.y, vx: body.vx, vy: body.vy,
+              grounded: body.onGround, wallClingDir: body.touchingWallDir, alive: !body.dead,
+            },
+            localTiles,
+            enemies: [],
+            bullets: [],
+            goal: goalRect ? { dx: goalRect.x - body.x, dy: goalRect.y - body.y } : { dx: 0, dy: 0 },
+          };
+        }
+        collideBodyAndResolve(body, axis, action) {
+          const left = Math.floor(body.x / TILE), right = Math.floor((body.x + body.w) / TILE);
+          const top = Math.floor(body.y / TILE), bottom = Math.floor((body.y + body.h) / TILE);
+          if (axis === "x") body.touchingWallDir = 0;
+          for (let ty = top - 1; ty <= bottom + 1; ty++) {
+            for (let tx = left - 1; tx <= right + 1; tx++) {
+              const tile = tileAt(tx, ty);
+              if (tile === "!") {
+                const tr = { x: tx * TILE, y: ty * TILE, w: TILE, h: TILE };
+                if (overlaps(body, tr)) body.dead = true;
+              }
+              if (!isSolid(tile)) continue;
+              const tr = { x: tx * TILE, y: ty * TILE, w: TILE, h: TILE };
+              if (!overlaps(body, tr)) continue;
+              if (tile === "-") {
+                if (axis === "x" || body.vy <= 0 || action.down) continue;
+                const prevBottom = (body.y - body.vy * FIXED_DT) + body.h;
+                if (prevBottom > tr.y + 0.1) continue;
+              }
+              const penL = (body.x + body.w) - tr.x, penR = (tr.x + tr.w) - body.x;
+              const penT = (body.y + body.h) - tr.y, penB = (tr.y + tr.h) - body.y;
+              if (axis === "x") {
+                if (tile === "@") {
+                  if (body.vx > 0) body.touchingWallDir = 1;
+                  if (body.vx < 0) body.touchingWallDir = -1;
+                }
+                if (body.vx > 0) { body.x -= penL; body.vx = 0; } else if (body.vx < 0) { body.x += penR; body.vx = 0; }
+              } else {
+                if (body.vy > 0) { body.y -= penT; body.vy = 0; body.onGround = true; }
+                else if (body.vy < 0 && tile !== "-") { body.y += penB; body.vy = 0; }
+              }
+            }
+          }
+        }
+        actionForScout(obs, scout) {
+          const action = { left: false, right: false, jump: false, down: false };
+          let dir = obs.goal.dx < -10 ? -1 : 1;
+          const nearTowerClimb = obs.goal.dy < -TILE * 2.5;
+          if (nearTowerClimb && isWallAhead(obs, dir)) dir *= -1;
+          if (Math.random() < 0.45) dir = scout.dirBias;
+          dir = chooseSaferDirection(obs, dir);
+          action.left = dir < 0;
+          action.right = dir > 0;
+          if (isGapAhead(obs, dir) || isWallAhead(obs, dir) || isDeathAhead(obs, dir)) action.jump = true;
+          if (Math.random() < scout.jumpBias && obs.player.grounded) action.jump = true;
+          if (obs.player.wallClingDir !== 0 && Math.random() < scout.wallJumpBias) action.jump = true;
+          return makeAction(action);
+        }
+        stepPopulation() {
+          const maxFrames = Math.max(1, Math.floor(swarmSettings.episodeSeconds / FIXED_DT));
+          let alive = 0;
+          let bestIdx = 0;
+          let bestFit = -Infinity;
+          for (let i = 0; i < this.population.length; i++) {
+            const body = this.population[i];
+            if (body.dead) continue;
+            body.frames++;
+            const scout = this.scouts[body.scoutIndex];
+            const obs = this.buildObsForBody(body);
+            const action = this.actionForScout(obs, scout);
+
+            let ax = 0;
+            if (action.right) ax += 1;
+            if (action.left) ax -= 1;
+            const wasGrounded = body.onGround;
+            body.onGround = false;
+            body.vx += ax * MOVE_ACCEL * FIXED_DT;
+            body.vx = Math.max(-MAX_VX, Math.min(MAX_VX, body.vx));
+            if (ax === 0 || (ax < 0 && body.vx > 0) || (ax > 0 && body.vx < 0)) body.vx *= Math.exp(-FRICTION * FIXED_DT);
+            if (action.jump && wasGrounded) body.vy = JUMP_VY;
+            body.vy += GRAV * FIXED_DT;
+            if (body.touchingWallDir !== 0 && !wasGrounded) {
+              const holdingTowardsWall = (body.touchingWallDir === 1 && action.right) || (body.touchingWallDir === -1 && action.left);
+              if (holdingTowardsWall) {
+                if (body.vy > 60) body.vy = 60;
+                if (action.jump) { body.vy = JUMP_VY * 0.9; body.vx = -body.touchingWallDir * MAX_VX * 1.4; }
+              }
+            }
+            body.x += body.vx * FIXED_DT; this.collideBodyAndResolve(body, "x", action);
+            body.y += body.vy * FIXED_DT; this.collideBodyAndResolve(body, "y", action);
+
+            const dist = goalRect ? Math.hypot(goalRect.x - body.x, goalRect.y - body.y) : 0;
+            body.fitness = Math.max(body.fitness, (WORLD_W * 2) - dist);
+            scout.score += (body.fitness * 0.0002) + (body.onGround ? 0.005 : 0);
+            scout.uses += 1;
+
+            if (body.y > WORLD_H + 120 || body.frames >= maxFrames) body.dead = true;
+            if (goalRect && overlaps(body, goalRect)) { body.won = true; body.dead = true; scout.score += 120; }
+            if (!body.dead) alive++;
+            if (body.fitness > bestFit) { bestFit = body.fitness; bestIdx = i; }
+          }
+          this.leadBodyIndex = bestIdx;
+          if (alive === 0) {
+            this.onEpisodeEnd({ won: this.population.some((p) => p.won) });
+            this.reset();
+          }
+          return { alive, lead: this.population[this.leadBodyIndex] };
         }
         getVisitKey(obs) {
           const tx = Math.floor(obs.player.x / TILE);
@@ -694,6 +835,10 @@
           const elem = document.getElementById("gameContainer");
           if (!document.fullscreenElement) elem.requestFullscreen().catch(err => console.error(err));
           else document.exitFullscreen();
+      });
+      pauseBtnEl.addEventListener("click", () => {
+          isPaused = !isPaused;
+          pauseBtnEl.textContent = isPaused ? "▶ Resume" : "⏸ Pause";
       });
 
       function startReplay(runType) {
@@ -961,6 +1106,7 @@
 
           player = new Player();
           parseLevel();
+          if (agentManager.activeKey === "swarm") agentManager.agents.swarm.reset(buildObservation());
           timeElapsed = 0;
           currentRun = [];
           isReplaying = false;
@@ -982,6 +1128,23 @@
             } else { setTimeout(() => resetGame(), 500); }
         } else {
             if (player.dead) { resetGame(); return; }
+
+            if (agentManager.activeKey === "swarm") {
+                timeElapsed += FIXED_DT;
+                timerEl.textContent = timeElapsed.toFixed(2) + "s";
+                const swarmStep = agentManager.agents.swarm.stepPopulation();
+                const lead = swarmStep.lead;
+                if (lead) {
+                  player.x = lead.x;
+                  player.y = lead.y;
+                  player.dead = false;
+                }
+                if (swarmStep.alive <= 0) {
+                  timeElapsed = 0;
+                  timerEl.textContent = "0.00s";
+                }
+                return;
+            }
 
             if (!player.won) {
                 timeElapsed += FIXED_DT;
@@ -1072,6 +1235,25 @@
             ctx.fillRect(eyeX, e.y + 4, 4, 4);
         }
 
+        if (agentManager.activeKey === "swarm") {
+            const swarm = agentManager.agents.swarm;
+            const leadBody = swarm.population[swarm.leadBodyIndex];
+            for (let i = 0; i < swarm.population.length; i++) {
+                const body = swarm.population[i];
+                const sx = body.x - cam;
+                if (sx < -40 || sx > cv.width + 40) continue;
+                if (body.dead) {
+                  ctx.fillStyle = "rgba(255, 77, 109, 0.30)";
+                } else if (body === leadBody) {
+                  ctx.fillStyle = "rgba(124, 255, 215, 1)";
+                } else {
+                  ctx.fillStyle = "rgba(233, 233, 242, 0.72)";
+                }
+                ctx.fillRect(sx, body.y, body.w, body.h);
+            }
+            return;
+        }
+
         if (!isReplaying && bestRun.length > 0) {
             let ghostFrameIndex = Math.min(currentRun.length, bestRun.length - 1);
             let ghostState = bestRun[ghostFrameIndex];
@@ -1091,6 +1273,12 @@
       let accumulator = 0;
 
       function frame(currentTime) {
+        if (isPaused) {
+          lastTime = currentTime;
+          draw();
+          requestAnimationFrame(frame);
+          return;
+        }
         let dt = (currentTime - lastTime) / 1000;
         if (dt > 0.1) dt = 0.1; 
         lastTime = currentTime;

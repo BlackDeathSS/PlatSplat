@@ -1058,6 +1058,9 @@
                   timeElapsed = 0;
                   timerEl.textContent = "0.00s";
                 }
+                const targetCam = player.x - cv.width * 0.35;
+                cameraX += (targetCam - cameraX) * 0.12;
+                cameraX = Math.max(0, Math.min(WORLD_W - cv.width, cameraX));
                 return;
             }
 
@@ -1130,17 +1133,19 @@
           }
         }
 
-        ctx.fillStyle = "#ffaa00";
-        for (let b of bullets) { ctx.fillRect(b.x - cam, b.y, b.w, b.h); }
+        if (agentManager.activeKey !== "swarm") {
+            ctx.fillStyle = "#ffaa00";
+            for (let b of bullets) { ctx.fillRect(b.x - cam, b.y, b.w, b.h); }
 
-        for (let e of enemies) {
-            if (e.dead) continue;
-            ctx.fillStyle = e.type === 'R' ? "rgba(255, 77, 109, 1)" : "rgba(200, 50, 200, 1)";
-            ctx.fillRect(e.x - cam, e.y, e.w, e.h);
-            
-            ctx.fillStyle = "#fff";
-            let eyeX = e.facingLeft ? e.x - cam + 2 : e.x - cam + e.w - 6;
-            ctx.fillRect(eyeX, e.y + 4, 4, 4);
+            for (let e of enemies) {
+                if (e.dead) continue;
+                ctx.fillStyle = e.type === 'R' ? "rgba(255, 77, 109, 1)" : "rgba(200, 50, 200, 1)";
+                ctx.fillRect(e.x - cam, e.y, e.w, e.h);
+                
+                ctx.fillStyle = "#fff";
+                let eyeX = e.facingLeft ? e.x - cam + 2 : e.x - cam + e.w - 6;
+                ctx.fillRect(eyeX, e.y + 4, 4, 4);
+            }
         }
 
         if (agentManager.activeKey === "swarm") {

@@ -433,316 +433,177 @@
         onEpisodeEnd() {}
       }
 
+      class NeuralNet {
+        constructor(inputNodes, hiddenNodes, outputNodes) {
+          this.inputNodes = inputNodes; this.hiddenNodes = hiddenNodes; this.outputNodes = outputNodes;
+          this.weightsIH = Array.from({ length: hiddenNodes }, () => Array.from({ length: inputNodes }, () => (Math.random() * 2) - 1));
+          this.weightsHO = Array.from({ length: outputNodes }, () => Array.from({ length: hiddenNodes }, () => (Math.random() * 2) - 1));
+          this.biasH = Array.from({ length: hiddenNodes }, () => [(Math.random() * 2) - 1]);
+          this.biasO = Array.from({ length: outputNodes }, () => [(Math.random() * 2) - 1]);
+        }
+        sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
+        feedForward(inputArray) {
+          const hidden = this.weightsIH.map((row, i) => this.sigmoid(row.reduce((s, w, j) => s + w * inputArray[j], 0) + this.biasH[i][0]));
+          return this.weightsHO.map((row, i) => this.sigmoid(row.reduce((s, w, j) => s + w * hidden[j], 0) + this.biasO[i][0]));
+        }
+        mutate(rate) {
+          const mutateVal = (v) => (Math.random() < rate ? (Math.random() < 0.1 ? (Math.random() * 2) - 1 : v + (Math.random() * 0.4 - 0.2)) : v);
+          this.weightsIH = this.weightsIH.map((r) => r.map(mutateVal));
+          this.weightsHO = this.weightsHO.map((r) => r.map(mutateVal));
+          this.biasH = this.biasH.map(([v]) => [mutateVal(v)]);
+          this.biasO = this.biasO.map(([v]) => [mutateVal(v)]);
+        }
+        clone() {
+          const c = new NeuralNet(this.inputNodes, this.hiddenNodes, this.outputNodes);
+          c.weightsIH = this.weightsIH.map((r) => [...r]);
+          c.weightsHO = this.weightsHO.map((r) => [...r]);
+          c.biasH = this.biasH.map((r) => [...r]);
+          c.biasO = this.biasO.map((r) => [...r]);
+          return c;
+        }
+      }
+
       class HybridSwarmAgent {
         constructor() {
-          this.exploreEpsilon = 0.2;
-          this.ucbStrength = 1.6;
-          this.episodeFrameCounter = 0;
+          this.generation = 1;
+          this.highestFitnessOverall = -Infinity;
+          this.population = [];
+          this.leadBodyIndex = 0;
+          this.timeInEpisode = 0;
           this.reset();
         }
-        makeScout(i = 0) {
+        newBody(brain = null) {
           return {
-            dirBias: i % 2 === 0 ? 1 : -1,
-            jumpBias: 0.15 + ((i * 37) % 7) * 0.08,
-            wallJumpBias: 0.35 + ((i * 13) % 6) * 0.09,
-            score: 0,
-            uses: 0,
+            x: spawn.x, y: spawn.y, w: 18, h: 22, vx: 0, vy: 0,
+            onGround: false, touchingWallDir: 0, dead: false, won: false,
+            framesAlive: 0, jumpCount: 0, maxFitness: 0, fitness: 0,
+            keys: { left: false, right: false, jump: false, down: false, jumpPressed: false },
+            brain: brain || new NeuralNet(14, 16, 4),
+            rays: [],
           };
         }
-        reset(obs) {
-          const count = Math.max(12, swarmSettings.populationSize | 0);
-          if (!this.scouts || this.scouts.length !== count) {
-            this.scouts = Array.from({ length: count }, (_, i) => this.makeScout(i));
-          } else {
-            this.scouts.forEach((scout, i) => {
-              scout.score = 0;
-              scout.uses = 0;
-              scout.dirBias = i % 2 === 0 ? 1 : -1;
-            });
-          }
-          this.frames = 0;
-          this.stuckFrames = 0;
-          this.turnPreference = 1;
-          this.episodeFrameCounter = 0;
-          this.lastObs = obs || null;
-          this.lastScoutIndex = 0;
-          this.lastAction = makeAction();
-          this.visitHeat = new Map();
-          this.population = this.scouts.map((scout, idx) => ({
-            scoutIndex: idx,
-            x: spawn.x,
-            y: spawn.y,
-            w: 18,
-            h: 22,
-            vx: 0,
-            vy: 0,
-            onGround: false,
-            touchingWallDir: 0,
-            dead: false,
-            won: false,
-            fitness: 0,
-            frames: 0,
-          }));
+        reset() {
+          this.population = Array.from({ length: Math.max(10, swarmSettings.populationSize | 0) }, () => this.newBody());
           this.leadBodyIndex = 0;
+          this.timeInEpisode = 0;
         }
-        buildObsForBody(body) {
-          const playerCenterX = body.x + body.w / 2;
-          const playerCenterY = body.y + body.h / 2;
-          const tileX = Math.floor(playerCenterX / TILE);
-          const tileY = Math.floor(playerCenterY / TILE);
-          const halfW = 7;
-          const halfH = 5;
-          const localTiles = [];
-          for (let dy = -halfH; dy <= halfH; dy++) {
-            const row = [];
-            for (let dx = -halfW; dx <= halfW; dx++) row.push(tileCode(tileAt(tileX + dx, tileY + dy)));
-            localTiles.push(row);
+        castRay(body, angle) {
+          let rx = body.x + body.w / 2, ry = body.y + body.h / 2;
+          const dx = Math.cos(angle), dy = Math.sin(angle);
+          let dist = 0;
+          const maxDist = TILE * 10, step = 6;
+          while (dist < maxDist) {
+            rx += dx * step; ry += dy * step; dist += step;
+            const tile = tileAt(Math.floor(rx / TILE), Math.floor(ry / TILE));
+            if (isSolid(tile) || tile === "!") return dist / maxDist;
           }
-          return {
-            player: {
-              x: body.x, y: body.y, vx: body.vx, vy: body.vy,
-              grounded: body.onGround, wallClingDir: body.touchingWallDir, alive: !body.dead,
-            },
-            localTiles,
-            enemies: [],
-            bullets: [],
-            goal: goalRect ? { dx: goalRect.x - body.x, dy: goalRect.y - body.y } : { dx: 0, dy: 0 },
-          };
+          return 1;
         }
-        collideBodyAndResolve(body, axis, action) {
+        think(body) {
+          body.rays = [];
+          for (let i = 0; i < 8; i++) body.rays.push(this.castRay(body, (i * Math.PI) / 4));
+          const inputs = [(goalRect.x - body.x) / WORLD_W, (goalRect.y - body.y) / WORLD_H, body.vx / MAX_VX, body.vy / 1000, body.touchingWallDir, body.onGround ? 1 : 0, ...body.rays];
+          const out = body.brain.feedForward(inputs);
+          body.keys.jumpPressed = out[0] > 0.5 && !body.keys.jump;
+          body.keys.jump = out[0] > 0.5;
+          body.keys.left = out[1] > 0.5;
+          body.keys.down = out[2] > 0.5;
+          body.keys.right = out[3] > 0.5;
+        }
+        collide(body, axis) {
           const left = Math.floor(body.x / TILE), right = Math.floor((body.x + body.w) / TILE);
           const top = Math.floor(body.y / TILE), bottom = Math.floor((body.y + body.h) / TILE);
           if (axis === "x") body.touchingWallDir = 0;
           for (let ty = top - 1; ty <= bottom + 1; ty++) {
             for (let tx = left - 1; tx <= right + 1; tx++) {
               const tile = tileAt(tx, ty);
-              if (tile === "!") {
-                const tr = { x: tx * TILE, y: ty * TILE, w: TILE, h: TILE };
-                if (overlaps(body, tr)) body.dead = true;
-              }
-              if (!isSolid(tile)) continue;
               const tr = { x: tx * TILE, y: ty * TILE, w: TILE, h: TILE };
-              if (!overlaps(body, tr)) continue;
-              if (tile === "-") {
-                if (axis === "x" || body.vy <= 0 || action.down) continue;
-                const prevBottom = (body.y - body.vy * FIXED_DT) + body.h;
-                if (prevBottom > tr.y + 0.1) continue;
-              }
+              if (tile === "!" && overlaps(body, tr)) body.dead = true;
+              if (!isSolid(tile) || !overlaps(body, tr)) continue;
+              if (tile === "-" && (axis === "x" || body.vy <= 0 || body.keys.down)) continue;
               const penL = (body.x + body.w) - tr.x, penR = (tr.x + tr.w) - body.x;
               const penT = (body.y + body.h) - tr.y, penB = (tr.y + tr.h) - body.y;
               if (axis === "x") {
-                if (tile === "@") {
-                  if (body.vx > 0) body.touchingWallDir = 1;
-                  if (body.vx < 0) body.touchingWallDir = -1;
-                }
+                if (tile === "@") body.touchingWallDir = body.vx > 0 ? 1 : (body.vx < 0 ? -1 : 0);
                 if (body.vx > 0) { body.x -= penL; body.vx = 0; } else if (body.vx < 0) { body.x += penR; body.vx = 0; }
-              } else {
-                if (body.vy > 0) { body.y -= penT; body.vy = 0; body.onGround = true; }
-                else if (body.vy < 0 && tile !== "-") { body.y += penB; body.vy = 0; }
-              }
+              } else if (body.vy > 0) { body.y -= penT; body.vy = 0; body.onGround = true; }
+              else if (body.vy < 0 && tile !== "-") { body.y += penB; body.vy = 0; }
             }
           }
         }
-        actionForScout(obs, scout) {
-          const action = { left: false, right: false, jump: false, down: false };
-          let dir = obs.goal.dx < -10 ? -1 : 1;
-          const nearTowerClimb = obs.goal.dy < -TILE * 2.5;
-          if (nearTowerClimb && isWallAhead(obs, dir)) dir *= -1;
-          if (Math.random() < 0.45) dir = scout.dirBias;
-          dir = chooseSaferDirection(obs, dir);
-          action.left = dir < 0;
-          action.right = dir > 0;
-          if (isGapAhead(obs, dir) || isWallAhead(obs, dir) || isDeathAhead(obs, dir)) action.jump = true;
-          if (Math.random() < scout.jumpBias && obs.player.grounded) action.jump = true;
-          if (obs.player.wallClingDir !== 0 && Math.random() < scout.wallJumpBias) action.jump = true;
-          return makeAction(action);
+        updateBody(body, epLimitSeconds) {
+          if (body.dead || body.won) return;
+          body.framesAlive++;
+          this.think(body);
+          const distToGoal = Math.hypot(goalRect.x - body.x, goalRect.y - body.y);
+          body.maxFitness = Math.max(body.maxFitness, (WORLD_W * 2) - distToGoal);
+          let ax = 0;
+          if (body.keys.right) ax += 1;
+          if (body.keys.left) ax -= 1;
+          const wasGrounded = body.onGround;
+          body.onGround = false;
+          body.vx += ax * MOVE_ACCEL * FIXED_DT;
+          body.vx = Math.max(-MAX_VX, Math.min(MAX_VX, body.vx));
+          if (ax === 0 || (ax < 0 && body.vx > 0) || (ax > 0 && body.vx < 0)) body.vx *= Math.exp(-FRICTION * FIXED_DT);
+          if (body.keys.jump && wasGrounded) { body.vy = JUMP_VY; body.jumpCount++; }
+          body.vy += GRAV * FIXED_DT;
+          if (body.touchingWallDir !== 0 && !wasGrounded) {
+            const hold = (body.touchingWallDir === 1 && body.keys.right) || (body.touchingWallDir === -1 && body.keys.left);
+            if (hold) {
+              if (body.vy > 60) body.vy = 60;
+              if (body.keys.jumpPressed) { body.vy = JUMP_VY * 0.9; body.vx = -body.touchingWallDir * MAX_VX * 1.5; }
+            }
+          }
+          body.x += body.vx * FIXED_DT; this.collide(body, "x");
+          body.y += body.vy * FIXED_DT; this.collide(body, "y");
+          if (body.y > WORLD_H + 120 || body.framesAlive > epLimitSeconds * 60) body.dead = true;
+          if (goalRect && overlaps(body, goalRect)) { body.won = true; body.dead = true; }
+          body.keys.jumpPressed = false;
+        }
+        nextGeneration() {
+          const mutRate = swarmSettings.mutationRate;
+          const size = Math.max(10, swarmSettings.populationSize | 0);
+          for (const p of this.population) {
+            p.fitness = p.maxFitness - (p.jumpCount * 15);
+            if (p.framesAlive < 30) p.fitness *= 0.1;
+            if (p.won) p.fitness += 10000;
+            if (p.fitness < 0) p.fitness = 0;
+          }
+          this.population.sort((a, b) => b.fitness - a.fitness);
+          if (this.population[0] && this.population[0].fitness > this.highestFitnessOverall) this.highestFitnessOverall = this.population[0].fitness;
+          const bestBrain = this.population[0] ? this.population[0].brain : new NeuralNet(14, 16, 4);
+          const next = [this.newBody(bestBrain.clone())];
+          for (let i = 1; i < size; i++) {
+            if (i < size * 0.9) {
+              const child = bestBrain.clone();
+              child.mutate(mutRate);
+              next.push(this.newBody(child));
+            } else next.push(this.newBody());
+          }
+          this.population = next;
+          this.generation++;
+          this.timeInEpisode = 0;
+          this.leadBodyIndex = 0;
         }
         stepPopulation() {
-          const maxFrames = Math.max(1, Math.floor(swarmSettings.episodeSeconds / FIXED_DT));
-          let alive = 0;
-          let bestIdx = 0;
-          let bestFit = -Infinity;
+          this.timeInEpisode += FIXED_DT;
+          const epLimit = Math.max(2, swarmSettings.episodeSeconds | 0);
+          let alive = 0, bestFitness = -Infinity, bestIdx = 0;
           for (let i = 0; i < this.population.length; i++) {
-            const body = this.population[i];
-            if (body.dead) continue;
-            body.frames++;
-            const scout = this.scouts[body.scoutIndex];
-            const obs = this.buildObsForBody(body);
-            const action = this.actionForScout(obs, scout);
-
-            let ax = 0;
-            if (action.right) ax += 1;
-            if (action.left) ax -= 1;
-            const wasGrounded = body.onGround;
-            body.onGround = false;
-            body.vx += ax * MOVE_ACCEL * FIXED_DT;
-            body.vx = Math.max(-MAX_VX, Math.min(MAX_VX, body.vx));
-            if (ax === 0 || (ax < 0 && body.vx > 0) || (ax > 0 && body.vx < 0)) body.vx *= Math.exp(-FRICTION * FIXED_DT);
-            if (action.jump && wasGrounded) body.vy = JUMP_VY;
-            body.vy += GRAV * FIXED_DT;
-            if (body.touchingWallDir !== 0 && !wasGrounded) {
-              const holdingTowardsWall = (body.touchingWallDir === 1 && action.right) || (body.touchingWallDir === -1 && action.left);
-              if (holdingTowardsWall) {
-                if (body.vy > 60) body.vy = 60;
-                if (action.jump) { body.vy = JUMP_VY * 0.9; body.vx = -body.touchingWallDir * MAX_VX * 1.4; }
-              }
+            const p = this.population[i];
+            if (!p.dead) {
+              this.updateBody(p, epLimit);
+              if (!p.dead) alive++;
             }
-            body.x += body.vx * FIXED_DT; this.collideBodyAndResolve(body, "x", action);
-            body.y += body.vy * FIXED_DT; this.collideBodyAndResolve(body, "y", action);
-
-            const dist = goalRect ? Math.hypot(goalRect.x - body.x, goalRect.y - body.y) : 0;
-            body.fitness = Math.max(body.fitness, (WORLD_W * 2) - dist);
-            scout.score += (body.fitness * 0.0002) + (body.onGround ? 0.005 : 0);
-            scout.uses += 1;
-
-            if (body.y > WORLD_H + 120 || body.frames >= maxFrames) body.dead = true;
-            if (goalRect && overlaps(body, goalRect)) { body.won = true; body.dead = true; scout.score += 120; }
-            if (!body.dead) alive++;
-            if (body.fitness > bestFit) { bestFit = body.fitness; bestIdx = i; }
+            if (p.maxFitness > bestFitness) { bestFitness = p.maxFitness; bestIdx = i; }
           }
           this.leadBodyIndex = bestIdx;
-          if (alive === 0) {
-            this.onEpisodeEnd({ won: this.population.some((p) => p.won) });
-            this.reset();
-          }
+          if (alive === 0 || this.timeInEpisode >= epLimit) this.nextGeneration();
           return { alive, lead: this.population[this.leadBodyIndex] };
         }
-        getVisitKey(obs) {
-          const tx = Math.floor(obs.player.x / TILE);
-          const ty = Math.floor(obs.player.y / TILE);
-          return `${tx},${ty}`;
-        }
-        rememberVisit(obs) {
-          const key = this.getVisitKey(obs);
-          this.visitHeat.set(key, (this.visitHeat.get(key) || 0) + 1);
-        }
-        getScoutIndex() {
-          this.frames++;
-          if (Math.random() < this.exploreEpsilon) return Math.floor(Math.random() * this.scouts.length);
-          const logTerm = Math.log(this.frames + 2);
-          let bestIndex = 0;
-          let bestValue = -Infinity;
-          for (let i = 0; i < this.scouts.length; i++) {
-            const s = this.scouts[i];
-            const mean = s.uses > 0 ? s.score / s.uses : 0.1;
-            const ucb = mean + this.ucbStrength * Math.sqrt(logTerm / (s.uses + 1));
-            if (ucb > bestValue) {
-              bestValue = ucb;
-              bestIndex = i;
-            }
-          }
-          return bestIndex;
-        }
-        act(obs) {
-          this.episodeFrameCounter++;
-          this.rememberVisit(obs);
-          const action = { left: false, right: false, jump: false, down: false };
-          const scoutIndex = this.getScoutIndex();
-          const scout = this.scouts[scoutIndex];
-          let dir = obs.goal.dx < -10 ? -1 : 1;
-
-          const nearTowerClimb = obs.goal.dy < -TILE * 2.5;
-          const sideWall = isWallAhead(obs, dir);
-          if (nearTowerClimb && sideWall) this.turnPreference = -dir;
-          if (this.stuckFrames > 24) this.turnPreference = -this.turnPreference;
-
-          if (nearTowerClimb) dir = this.turnPreference;
-          if (Math.random() < 0.35) dir = scout.dirBias;
-          dir = chooseSaferDirection(obs, dir);
-
-          action.left = dir < 0;
-          action.right = dir > 0;
-
-          const jumpNeeded = isGapAhead(obs, dir) || isWallAhead(obs, dir) || isDeathAhead(obs, dir);
-          if (jumpNeeded || (isEnemyThreat(obs, TILE * 2.7) && obs.player.grounded)) action.jump = true;
-          if (Math.random() < scout.jumpBias && obs.player.grounded) action.jump = true;
-
-          if (shouldAvoidEnemyLanding(obs, dir) && obs.player.grounded) {
-            action.jump = true;
-            action.left = dir > 0;
-            action.right = dir < 0;
-          }
-          if (shouldEvadeMidairEnemy(obs, dir)) {
-            action.left = dir > 0;
-            action.right = dir < 0;
-          }
-
-          if (obs.player.wallClingDir !== 0) {
-            const awayDir = -obs.player.wallClingDir;
-            action.left = awayDir < 0;
-            action.right = awayDir > 0;
-            if (Math.random() < scout.wallJumpBias || shouldWallJump(obs, dir)) action.jump = true;
-          }
-          if (isIncomingBullet(obs, 24)) {
-            const evadeDir = chooseSaferDirection(obs, -dir);
-            action.left = evadeDir < 0;
-            action.right = evadeDir > 0;
-            if (obs.player.grounded) action.jump = true;
-          }
-
-          this.lastScoutIndex = scoutIndex;
-          this.lastAction = makeAction(action);
-          return this.lastAction;
-        }
-        onStep(prevObs, currentObs) {
-          if (!prevObs || !currentObs) return;
-          const scout = this.scouts[this.lastScoutIndex];
-          if (!scout) return;
-
-          const prevDist = goalDistanceScore(prevObs);
-          const currDist = goalDistanceScore(currentObs);
-          const progressReward = (prevDist - currDist) * 0.08;
-          const climbReward = currentObs.goal.dy < 0 ? (prevObs.player.y - currentObs.player.y) * 0.03 : 0;
-          const forwardReward = (currentObs.player.x - prevObs.player.x) * 0.015;
-          const stallPenalty = Math.hypot(currentObs.player.x - prevObs.player.x, currentObs.player.y - prevObs.player.y) < 0.8 ? -0.08 : 0;
-          const revisitPenalty = ((this.visitHeat.get(this.getVisitKey(currentObs)) || 1) - 1) * -0.01;
-          const deathPenalty = (prevObs.player.alive && !currentObs.player.alive) ? -0.4 : 0;
-
-          const stepScore = progressReward + climbReward + forwardReward + stallPenalty + revisitPenalty + deathPenalty;
-          scout.score += stepScore;
-          scout.uses += 1;
-
-          if (stallPenalty < 0) this.stuckFrames++;
-          else this.stuckFrames = Math.max(0, this.stuckFrames - 2);
-
-          this.lastObs = currentObs;
-        }
-        mutateValue(value, range = 0.4) {
-          if (Math.random() > swarmSettings.mutationRate) return value;
-          if (Math.random() < 0.08) return (Math.random() * 2) - 1;
-          return value + (Math.random() * range - range / 2);
-        }
-        evolveScouts() {
-          this.scouts.sort((a, b) => (b.score / (b.uses + 1)) - (a.score / (a.uses + 1)));
-          const elites = Math.max(2, Math.floor(this.scouts.length * 0.14));
-          const elitePool = this.scouts.slice(0, elites).map((s) => ({ ...s }));
-          const next = [];
-          for (let i = 0; i < this.scouts.length; i++) {
-            if (i < elites) {
-              const e = elitePool[i % elitePool.length];
-              next.push({ ...e, score: 0, uses: 0 });
-              continue;
-            }
-            const parent = elitePool[Math.floor(Math.random() * elitePool.length)];
-            next.push({
-              dirBias: this.mutateValue(parent.dirBias, 1.2) >= 0 ? 1 : -1,
-              jumpBias: Math.max(0.02, Math.min(0.95, this.mutateValue(parent.jumpBias, 0.25))),
-              wallJumpBias: Math.max(0.05, Math.min(0.98, this.mutateValue(parent.wallJumpBias, 0.3))),
-              score: 0,
-              uses: 0,
-            });
-          }
-          this.scouts = next;
-        }
-        onEpisodeEnd(result) {
-          const terminalBonus = result.won ? 80 : -8;
-          const scout = this.scouts[this.lastScoutIndex];
-          if (scout) {
-            scout.score += terminalBonus;
-            scout.uses += 1;
-          }
-          this.evolveScouts();
-        }
+        act() { return makeAction(); }
+        onStep() {}
+        onEpisodeEnd() {}
       }
 
       class AgentManager {
@@ -795,6 +656,8 @@
       refreshSwarmUi();
       agentSelectEl.addEventListener("change", () => {
         agentManager.setActive(agentSelectEl.value);
+        isPaused = false;
+        pauseBtnEl.textContent = "⏸ Pause";
         refreshSwarmUi();
         resetGame();
       });

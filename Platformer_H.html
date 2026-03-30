@@ -179,6 +179,7 @@
       let cameraX = 0;
       let timeElapsed = 0;
       let isPaused = false;
+      let initialEnemyTemplates = [];
       
       let currentRun = [];
       let lastRun = [];
@@ -769,7 +770,6 @@
 
       let enemies = [];
       let bullets = [];
-      let initialEnemyTemplates = [];
 
       class Bullet {
           constructor(x, y, dir) {

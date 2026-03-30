@@ -480,6 +480,10 @@
             keys: { left: false, right: false, jump: false, down: false, jumpPressed: false },
             brain: brain || new NeuralNet(14, 16, 4),
             rays: [],
+            enemies: initialEnemyTemplates.map((e) => ({
+              x: e.x, y: e.y, w: 18, h: 22, type: e.type,
+              vx: -60, vy: 0, dead: false, facingLeft: true
+            })),
           };
         }
         reset() {
@@ -556,9 +560,51 @@
           }
           body.x += body.vx * FIXED_DT; this.collide(body, "x");
           body.y += body.vy * FIXED_DT; this.collide(body, "y");
+
+          for (const e of body.enemies) {
+            if (e.dead) continue;
+            this.updateSwarmEnemy(e);
+            if (overlaps(body, e)) {
+              if (body.vy > 0 && body.y + body.h < e.y + e.h / 2 + 10) {
+                e.dead = true;
+                body.vy = JUMP_VY * 0.8;
+              } else body.dead = true;
+            }
+          }
+
           if (body.y > WORLD_H + 120 || body.framesAlive > epLimitSeconds * 60) body.dead = true;
           if (goalRect && overlaps(body, goalRect)) { body.won = true; body.dead = true; }
           body.keys.jumpPressed = false;
+        }
+        updateSwarmEnemy(e) {
+          e.vy += GRAV * FIXED_DT;
+          e.vx = e.type === "S" ? (e.facingLeft ? -40 : 40) : (e.facingLeft ? -60 : 60);
+          e.x += e.vx * FIXED_DT;
+          let hitWallX = false;
+          let left = Math.floor(e.x / TILE), right = Math.floor((e.x + e.w) / TILE);
+          let top = Math.floor(e.y / TILE), bottom = Math.floor((e.y + e.h - 1) / TILE);
+          for (let ty = top; ty <= bottom; ty++) {
+            for (let tx = left; tx <= right; tx++) {
+              const tile = tileAt(tx, ty);
+              if ((isSolid(tile) && tile !== "-") || tile === "!") {
+                hitWallX = true;
+                if (e.vx > 0) e.x = tx * TILE - e.w; else if (e.vx < 0) e.x = tx * TILE + TILE;
+                e.vx = 0;
+              }
+            }
+          }
+          if (hitWallX) e.facingLeft = !e.facingLeft;
+          e.y += e.vy * FIXED_DT;
+          left = Math.floor(e.x / TILE); right = Math.floor((e.x + e.w) / TILE);
+          top = Math.floor(e.y / TILE); bottom = Math.floor((e.y + e.h) / TILE);
+          for (let ty = top; ty <= bottom; ty++) {
+            for (let tx = left; tx <= right; tx++) {
+              if (isSolid(tileAt(tx, ty))) {
+                const tr = { x: tx * TILE, y: ty * TILE, w: TILE, h: TILE };
+                if (overlaps(e, tr) && e.vy > 0) { e.y = tr.y - e.h; e.vy = 0; }
+              }
+            }
+          }
         }
         nextGeneration() {
           const mutRate = swarmSettings.mutationRate;
@@ -588,14 +634,15 @@
         stepPopulation() {
           this.timeInEpisode += FIXED_DT;
           const epLimit = Math.max(2, swarmSettings.episodeSeconds | 0);
-          let alive = 0, bestFitness = -Infinity, bestIdx = 0;
+          let alive = 0, furthestX = -Infinity, bestIdx = 0;
           for (let i = 0; i < this.population.length; i++) {
             const p = this.population[i];
             if (!p.dead) {
               this.updateBody(p, epLimit);
               if (!p.dead) alive++;
             }
-            if (p.maxFitness > bestFitness) { bestFitness = p.maxFitness; bestIdx = i; }
+            const xScore = p.dead ? -Infinity : p.x;
+            if (xScore > furthestX) { furthestX = xScore; bestIdx = i; }
           }
           this.leadBodyIndex = bestIdx;
           if (alive === 0 || this.timeInEpisode >= epLimit) this.nextGeneration();
@@ -722,6 +769,7 @@
 
       let enemies = [];
       let bullets = [];
+      let initialEnemyTemplates = [];
 
       class Bullet {
           constructor(x, y, dir) {
@@ -945,11 +993,15 @@
       function parseLevel() {
         enemies = [];
         bullets = [];
+        initialEnemyTemplates = [];
         for (let y = 0; y < rows; y++) {
           for (let x = 0; x < cols; x++) {
             let ch = LEVEL[y][x];
             if (ch === "G") goalRect = { x: x * TILE, y: y * TILE - TILE, w: TILE, h: TILE * 2 };
-            if (ch === "S" || ch === "R") enemies.push(new Enemy(x * TILE, y * TILE, ch));
+            if (ch === "S" || ch === "R") {
+              enemies.push(new Enemy(x * TILE, y * TILE, ch));
+              initialEnemyTemplates.push({ x: x * TILE, y: y * TILE, type: ch });
+            }
           }
         }
       }
@@ -1048,13 +1100,6 @@
                 }
             }
 
-            if (agentManager.activeKey === "swarm") {
-              const maxFrames = Math.max(1, Math.floor(swarmSettings.episodeSeconds / FIXED_DT));
-              if (agentManager.agents.swarm.episodeFrameCounter >= maxFrames && !player.won) {
-                player.dead = true;
-              }
-            }
-
             const currentObs = buildObservation();
             agentManager.onStep(prevObs, currentObs);
         }
@@ -1101,6 +1146,13 @@
         if (agentManager.activeKey === "swarm") {
             const swarm = agentManager.agents.swarm;
             const leadBody = swarm.population[swarm.leadBodyIndex];
+            if (leadBody) {
+              for (const e of leadBody.enemies) {
+                if (e.dead) continue;
+                ctx.fillStyle = e.type === 'R' ? "rgba(255, 77, 109, 1)" : "rgba(200, 50, 200, 1)";
+                ctx.fillRect(e.x - cam, e.y, e.w, e.h);
+              }
+            }
             for (let i = 0; i < swarm.population.length; i++) {
                 const body = swarm.population[i];
                 const sx = body.x - cam;
